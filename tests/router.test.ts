@@ -214,7 +214,18 @@ describe('laya rules', () => {
   test('mechanical needs a confident low-difficulty reading and no signals', () => {
     expect(decideFromLaya(reading([0.6, 0.3, 0.08, 0.02], 0.01), []).tier).toBe('mechanical')
     expect(decideFromLaya(reading([0.6, 0.3, 0.08, 0.02], 0.01), ['auth']).tier).toBe('hard')
-    expect(decideFromLaya(reading([0.5, 0.3, 0.18, 0.02], 0.01), []).tier).toBe('ordinary')
+    expect(decideFromLaya(reading([0.5, 0.2, 0.28, 0.02], 0.01), []).tier).toBe('ordinary')
+  })
+
+  test('the move-down bar is 0.75: push and commit go down, a typo fix and a rename do not yet', () => {
+    // Measured from the local laya-serve on 2026-10-08.
+    const tier = (low: number, mid: number, high: number) =>
+      decideFromLaya(reading([low, 0, mid, high], 0.1), []).tier
+    expect(tier(0.80, 0.16, 0.04)).toBe('mechanical') // push to the develop
+    expect(tier(0.76, 0.22, 0.02)).toBe('mechanical') // commit these changes
+    expect(tier(0.74, 0.22, 0.04)).toBe('ordinary')
+    expect(tier(0.65, 0.28, 0.07)).toBe('ordinary') // fix the typo in README.md
+    expect(tier(0.55, 0.36, 0.09)).toBe('ordinary') // rename usr to user
   })
 
   test('an easy-looking request with any sensitivity does not move down', () => {

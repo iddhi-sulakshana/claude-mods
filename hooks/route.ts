@@ -116,6 +116,14 @@ export const SENSITIVE_AT = 0.5
  * `is_sensitive` clearly low.
  */
 export const CALM_BELOW = 0.2
+/**
+ * Laya's mechanical probability (trivial + easy) at or above which a turn can
+ * move down. Lower than CONFIDENT: everyday requests such as "push to the
+ * develop" (0.80) or "commit these changes" (0.76) score between 0.7 and 0.9,
+ * so 0.85 left them on Sonnet. The sensitive check and the keyword signals
+ * still apply.
+ */
+export const LAYA_DOWN = 0.75
 
 export const LAYA_QUESTIONS = {
   difficulty: {
@@ -203,7 +211,7 @@ export function parseLaya(text: string): LayaReading | undefined {
 /**
  * The tier from Laya's distribution. A hard-tier probability of HARD_AT moves
  * up; a high-stakes signal lifts the turn to hard unless ordinary is
- * confident; mechanical needs a CONFIDENT probability and a calm reading.
+ * confident; mechanical needs a LAYA_DOWN probability and a calm reading.
  */
 export function decideFromLaya(reading: LayaReading, keywordSignals: readonly string[]): Decision {
   const f = (n: number) => n.toFixed(2)
@@ -221,12 +229,12 @@ export function decideFromLaya(reading: LayaReading, keywordSignals: readonly st
     why.push(`signals (${signals.join(', ')}), up to hard`)
     return { tier: 'hard', why }
   }
-  if (reading.low >= CONFIDENT && signals.length === 0) {
+  if (reading.low >= LAYA_DOWN && signals.length === 0) {
     if (reading.sensitive < CALM_BELOW) return { tier: 'mechanical', why }
     why.push(`sensitive ${f(reading.sensitive)} ≥ ${CALM_BELOW}, not confident enough to move down`)
     return { tier: 'ordinary', why }
   }
-  if (reading.low > reading.mid) why.push(`mechanical ${f(reading.low)} < ${CONFIDENT}, not confident enough to move down`)
+  if (reading.low > reading.mid) why.push(`mechanical ${f(reading.low)} < ${LAYA_DOWN}, not confident enough to move down`)
   return { tier: 'ordinary', why }
 }
 
