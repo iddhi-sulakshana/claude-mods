@@ -2,7 +2,18 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, TurnStepInput } from 'claude-code'
 
-import { DEFAULTS, decide, decideFromLaya, highStakesSignals, parseLaya, parseVerdict, plan } from '../hooks/route'
+import {
+  DEFAULTS,
+  continuationDecision,
+  decide,
+  decideFromLaya,
+  highStakesSignals,
+  isContinuation,
+  layaBody,
+  parseLaya,
+  parseVerdict,
+  plan,
+} from '../hooks/route'
 import type { LayaReading } from '../hooks/route'
 
 describe('rules', () => {
@@ -214,6 +225,22 @@ describe('laya rules', () => {
     expect(decideFromLaya(reading([0.6, 0.29, 0.09, 0.02], 0.05), []).tier).toBe('mechanical')
   })
 
+  test('laya is sent the prompt alone', () => {
+    // Measured live: with a long previous reply beside it, "commit" read low 0.19 instead of 0.86.
+    expect(JSON.parse(layaBody('commit')).state).toEqual({ request: 'commit' })
+  })
+
+  test('a short approval is a continuation; one with a task of its own is not', () => {
+    for (const yes of ['yes', 'Go ahead!', 'ok, do it please', 'lgtm', 'sounds good, thanks', 'continue']) {
+      expect(isContinuation(yes)).toBe(true)
+    }
+    for (const task of ['commit', 'go fix the race in auth', 'yes, and fix the auth race', 'next refactor utils', 'please', '']) {
+      expect(isContinuation(task)).toBe(false)
+    }
+    expect(continuationDecision('hard').tier).toBe('hard')
+    expect(continuationDecision(null).tier).toBe('ordinary')
+  })
+
   test('an answer of the wrong shape is unreadable', () => {
     expect(parseLaya('{"answers":{}}')).toBeUndefined()
     expect(parseLaya('not json')).toBeUndefined()
@@ -291,5 +318,18 @@ describe('a turn classified by laya', () => {
 
     expect(sent).toEqual([STEP])
     expect(logs.at(-1)).toBe('router: laya gave no answer within 5s → request unchanged')
+  })
+
+  test('a continuation inherits the previous tier without asking laya', async ($, on) => {
+    const { logs, sent, posted } = layaWorld(on, async () => ({ status: 200, text: layaAnswer([0.01, 0.14, 0.53, 0.32], 0.08) }))
+    await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+    await $.prompt.submit(typed('plan the token migration across services'))
+    await runStep($, { ...STEP, turnId: 't1' })
+    await $.prompt.submit(typed('yes, go ahead'))
+    await runStep($, { ...STEP, turnId: 't2' })
+
+    expect(posted.length).toBe(1)
+    expect(sent.map(s => s.effort)).toEqual(['xhigh', 'xhigh'])
+    expect(logs.at(-1)).toContain('continuation of the previous turn (hard)')
   })
 })

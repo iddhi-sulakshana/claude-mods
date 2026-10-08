@@ -5,9 +5,11 @@ import {
   CLASSIFIER_SYSTEM,
   DEFAULTS,
   classifierPrompt,
+  continuationDecision,
   decide,
   decideFromLaya,
   highStakesSignals,
+  isContinuation,
   layaBody,
   logLine,
   parseLaya,
@@ -25,6 +27,7 @@ const LAYA_TIMEOUT_MS = 5_000
 const pausedAtom = atom({ plugin: 'model-router', key: 'isPaused' } as const, false)
 const switchAtom = atom({ plugin: 'model-router', key: 'modelSwitch' } as const, null)
 const lastAtom = atom({ plugin: 'model-router', key: 'last' } as const, null)
+const lastTierAtom = atom({ plugin: 'model-router', key: 'lastTier' } as const, null)
 
 // Module variables start over on a hot reload; a turn caught mid-reload is sent unchanged.
 let config: Config = DEFAULTS
@@ -56,7 +59,7 @@ async function previousReply($: $): Promise<string | undefined> {
 }
 
 /** Asks the local Laya server; a string says why there is no decision. */
-async function classifyWithLaya($: $, text: string, reply: string | undefined): Promise<Decision | string> {
+async function classifyWithLaya($: $, text: string): Promise<Decision | string> {
   const stop = new AbortController()
   const timeout = $.clock
     .sleep(LAYA_TIMEOUT_MS, { signal: stop.signal })
@@ -65,7 +68,7 @@ async function classifyWithLaya($: $, text: string, reply: string | undefined): 
   const request = $.http.fetch(`${config.layaUrl}/v1/systemone`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: layaBody(text, reply),
+    body: layaBody(text),
   })
   try {
     const response = await Promise.race([request, timeout])
@@ -108,15 +111,18 @@ async function routeTurn($: $, e: TurnStepInput): Promise<Plan | undefined> {
     return undefined
   }
 
-  const reply = await previousReply($).catch(() => undefined)
-  const classified =
-    config.classifier === 'laya' ? await classifyWithLaya($, text, reply) : await classifyWithModel($, text, reply)
+  const classified = isContinuation(text)
+    ? continuationDecision(await read($, lastTierAtom))
+    : config.classifier === 'laya'
+      ? await classifyWithLaya($, text)
+      : await classifyWithModel($, text, await previousReply($).catch(() => undefined))
   if (typeof classified === 'string') {
     await record($, `router: ${classified} → request unchanged`)
     return undefined
   }
 
   const decision = classified
+  await update($, lastTierAtom, () => decision.tier)
   const modelSwitch = await read($, switchAtom)
   const applied = plan(
     decision.tier,

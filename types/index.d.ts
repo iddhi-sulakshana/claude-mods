@@ -9,6 +9,8 @@ declare module 'claude-code' {
       modelSwitch: boolean | null
       /** The last decision's log line. */
       last: string | null
+      /** The last decided tier, which a short continuation ("yes", "go ahead") inherits. */
+      lastTier: 'mechanical' | 'ordinary' | 'hard' | null
     }
   }
 }

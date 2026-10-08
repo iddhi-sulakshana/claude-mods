@@ -16,7 +16,7 @@ When you submit a prompt, the router stores its text. At the turn's first model 
 
 ### `laya` (default): the local Laya decision server
 
-The router posts the prompt (and the previous reply) to laya-serve at `layaUrl` (default `http://127.0.0.1:8765/v1/systemone`). It asks Laya's own router questions: `difficulty` (trivial, easy, moderate or hard) and `is_sensitive` (money, legal, medical or safety). There's no API cost, and a warm server answers in about 0.5 s. If Laya hasn't answered within 5 s, the request goes out unchanged.
+The router posts the prompt alone to laya-serve at `layaUrl` (default `http://127.0.0.1:8765/v1/systemone`). It asks Laya's own router questions: `difficulty` (trivial, easy, moderate or hard) and `is_sensitive` (money, legal, medical or safety). There's no API cost, and a warm server answers in about 0.5 s. If Laya hasn't answered within 5 s, the request goes out unchanged.
 
 Laya returns calibrated probabilities, so the rules read the distribution. The mechanical tier is the trivial and easy probabilities added together.
 
@@ -24,6 +24,7 @@ Laya returns calibrated probabilities, so the rules read the distribution. The m
 - **High-stakes signals move up.** Laya's `is_sensitive` at 0.5 or more, or a high-stakes word in the prompt (prod, auth, payments, migration, secrets, …), makes the turn hard unless ordinary is at least 0.85.
 - **Moving down requires confidence.** A turn is mechanical only when the mechanical probability is at least 0.85, there are no signals, and `is_sensitive` is below 0.2. Laya scores how hard a request is to answer, not how risky it is. A short question about prod payments reads as easy (0.95), so the low-sensitivity check is part of being confident.
 - Anything else is ordinary.
+- **Short approvals inherit.** A reply made only of approval phrases ("yes", "go ahead", "ok do it", "lgtm") isn't classified. It takes the previous turn's tier, or ordinary if there is none. Laya never sees the previous reply because it scores everything it's given, and a long reply next to "commit" dropped its low-difficulty score from 0.86 to 0.19.
 
 ### `model`: a Claude model
 

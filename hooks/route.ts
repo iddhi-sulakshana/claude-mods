@@ -134,10 +134,40 @@ export const LAYA_QUESTIONS = {
   },
 } as const
 
-export function layaBody(request: string, previousReply: string | undefined): string {
-  const state: Record<string, string> = { request: clip(request, 1_500) }
-  if (previousReply) state.previous_reply = clip(previousReply, 600)
-  return JSON.stringify({ model: 'english', state, questions: LAYA_QUESTIONS })
+/**
+ * Laya scores everything in its state, not only `request`: a long previous
+ * reply beside "commit" read as moderate (low 0.19) where "commit" alone read
+ * as easy (low 0.86). So it gets the prompt alone, and a short continuation
+ * takes its tier from the turn before (isContinuation).
+ */
+export function layaBody(request: string): string {
+  return JSON.stringify({ model: 'english', state: { request: clip(request, 1_500) }, questions: LAYA_QUESTIONS })
+}
+
+const CONTINUATION_PHRASES = [
+  'y', 'yes', 'yeah', 'yep', 'yup', 'ok', 'okay', 'sure', 'go ahead', 'go for it', 'do it', 'do that',
+  'proceed', 'continue', 'carry on', 'keep going', 'lgtm', 'looks good', 'sounds good', 'ship it',
+  'please do', 'approve', 'approved', 'agreed', 'confirm', 'confirmed', 'that works',
+  // filler that may stand beside them
+  'please', 'thanks', 'thank you', 'now', 'then', 'and', 'it', 'that',
+]
+const CONTINUATION = new RegExp(`^(?:${CONTINUATION_PHRASES.join('|')})(?: (?:${CONTINUATION_PHRASES.join('|')}))*$`)
+
+/**
+ * A reply made only of approval or continuation phrases ("yes", "go ahead",
+ * "ok do it please"): it carries no task of its own, so it is not classified.
+ * One that adds a task ("yes, and fix the auth race") is classified as usual.
+ */
+export function isContinuation(text: string): boolean {
+  const plain = text.trim().toLowerCase().replace(/[^a-z0-9' ]+/g, ' ').replace(/\s+/g, ' ').trim()
+  return CONTINUATION.test(plain) && /[a-z]/.test(plain) && !/^(?:please|thanks|thank you|now|then|and|it|that)(?: |$)/.test(plain)
+}
+
+/** The decision for a continuation: the previous turn's tier, or ordinary when there was none. */
+export function continuationDecision(previous: Tier | null): Decision {
+  return previous === null
+    ? { tier: 'ordinary', why: ['continuation with no earlier decision, held at ordinary'] }
+    : { tier: previous, why: [`continuation of the previous turn (${previous})`] }
 }
 
 export type LayaReading = {
