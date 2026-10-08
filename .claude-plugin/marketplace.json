@@ -1,0 +1,6 @@
+{
+  "name": "model-router",
+  "description": "Per-turn model and effort routing for Claude Code.",
+  "owner": { "name": "iddhi" },
+  "plugins": [{ "name": "model-router", "source": "./" }]
+}
