@@ -1,0 +1,586 @@
+import { atom, read, update } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code'
+
+import type { BridgeKind, BridgeLogEntry, BridgeMessage, BridgePeer } from '../types'
+import {
+  RATE_LIMIT,
+  STALE_MS,
+  asKind,
+  clip,
+  defaultName,
+  describePeers,
+  formatDelivery,
+  formatHandoff,
+  formatPrompt,
+  handoffBody,
+  isLive,
+  newMessageId,
+  resolveTarget,
+  sanitizeName,
+  splitTarget,
+  withinWindow,
+} from './bridge'
+
+type $ = EngineInterface
+
+const PANE = 'session-bridge'
+const TOOL_FAILED = () => ({ deny: 'session-bridge: the bridge tool failed (run claude --debug for the reason).' })
+
+const meAtom = atom({ plugin: 'session-bridge', key: 'me' } as const, null)
+const peersAtom = atom({ plugin: 'session-bridge', key: 'peers' } as const, [])
+const logAtom = atom({ plugin: 'session-bridge', key: 'log' } as const, [])
+const autoAtom = atom({ plugin: 'session-bridge', key: 'isAuto' } as const, true)
+
+type Identity = { name: string; role: string }
+
+// Module variables start over on a hot reload; session.start sets them again.
+let root = ''
+let isPolling = false
+let autoStamps: number[] = []
+let lastStatus = ''
+
+const dirs = {
+  sessions: () => `${root}/sessions`,
+  inbox: (name: string) => `${root}/inbox/${name}`,
+  archive: (name: string) => `${root}/archive/${name}`,
+  handoffs: () => `${root}/handoffs`,
+}
+
+async function sh($: $, argv: string[]) {
+  try {
+    return (await $.process.run(argv, { timeoutMs: 10_000 })).exitCode === 0
+  } catch {
+    return false
+  }
+}
+
+async function me($: $): Promise<BridgePeer> {
+  const held = await read($, meAtom)
+  if (held === null) throw new Error('session bridge is not started yet')
+  return held
+}
+
+async function readPeers($: $): Promise<BridgePeer[]> {
+  const entries = await $.fs.list(dirs.sessions()).catch(() => [])
+  const peers: BridgePeer[] = []
+  for (const entry of entries) {
+    if (entry.kind !== 'file' || !entry.name.endsWith('.json')) continue
+    const path = `${dirs.sessions()}/${entry.name}`
+    try {
+      const peer = JSON.parse(await $.fs.read(path)) as BridgePeer
+      if (typeof peer.id === 'string' && typeof peer.name === 'string') peers.push(peer)
+    } catch {
+      // A half-written or foreign file: skip it, the next heartbeat rewrites ours.
+    }
+  }
+  return peers
+}
+
+async function showStatus($: $) {
+  const self = await read($, meAtom)
+  if (self === null) return
+  const now = await $.clock.now()
+  const peers = (await read($, peersAtom)).filter(p => p.id !== self.id && isLive(p, now))
+  const unread = (await read($, logAtom)).filter(l => l.direction === 'in' && !l.isDelivered).length
+  const isAuto = await read($, autoAtom)
+  const text = `⇄ ${self.name}${self.role !== 'general' ? ` (${self.role})` : ''} · ${peers.length} peer${peers.length === 1 ? '' : 's'}${unread > 0 ? ` · ${unread} unread` : ''}${isAuto ? '' : ' · manual'}`
+  if (text !== lastStatus) {
+    lastStatus = text
+    $.ui.status(text)
+  }
+}
+
+async function heartbeat($: $) {
+  const self = await me($)
+  const now = await $.clock.now()
+  const id = await $.session.id()
+  let next: BridgePeer = { ...self, cwd: await $.session.cwd(), updatedAt: now }
+  if (id !== self.id) {
+    // A /clear moved the process to a new session id: keep the identity.
+    await sh($, ['rm', '-f', `${dirs.sessions()}/${self.id}.json`])
+    await $.store.set(`identity:${id}`, { name: self.name, role: self.role })
+    next = { ...next, id }
+  }
+  await $.fs.write(`${dirs.sessions()}/${next.id}.json`, JSON.stringify(next))
+  await update($, meAtom, () => next)
+
+  const peers = await readPeers($)
+  for (const peer of peers) {
+    // Sessions that died without a session.end leave a file behind; sweep old ones.
+    if (peer.id !== next.id && now - peer.updatedAt > 10 * STALE_MS) {
+      await sh($, ['rm', '-f', `${dirs.sessions()}/${peer.id}.json`])
+    }
+  }
+  await update($, peersAtom, () => peers.filter(p => now - p.updatedAt <= 10 * STALE_MS))
+  await showStatus($)
+}
+
+function appendLog($: $, entries: BridgeLogEntry[]) {
+  return update($, logAtom, log => [...log, ...entries].slice(-100))
+}
+
+function markDelivered($: $, ids: ReadonlySet<string>) {
+  return update($, logAtom, log =>
+    log.map(l => (l.direction === 'in' && ids.has(l.message.id) ? { ...l, isDelivered: true } : l)),
+  )
+}
+
+async function unread($: $) {
+  return (await read($, logAtom)).filter(l => l.direction === 'in' && !l.isDelivered).map(l => l.message)
+}
+
+/** Moves each waiting message out of our inbox (the move is the claim) and hands it on. */
+async function poll($: $) {
+  if (isPolling) return
+  isPolling = true
+  try {
+    const self = await me($)
+    const inbox = dirs.inbox(self.name)
+    const entries = await $.fs.list(inbox).catch(() => [])
+    const waiting = entries
+      .filter(e => e.kind === 'file' && e.name.endsWith('.json') && !e.name.startsWith('.'))
+      .map(e => e.name)
+      .sort()
+    if (waiting.length === 0) return
+
+    const claimed: BridgeMessage[] = []
+    for (const name of waiting) {
+      const archived = `${dirs.archive(self.name)}/${name}`
+      if (!(await sh($, ['mv', `${inbox}/${name}`, archived]))) continue
+      try {
+        claimed.push(JSON.parse(await $.fs.read(archived)) as BridgeMessage)
+      } catch {
+        $.ui.log(`session-bridge: unreadable message ${archived}`, { to: 'debug' })
+      }
+    }
+    if (claimed.length === 0) return
+
+    await appendLog($, claimed.map(message => ({ direction: 'in', message, isDelivered: false })))
+    const senders = [...new Set(claimed.map(m => m.from.name))].join(', ')
+
+    const now = await $.clock.now()
+    autoStamps = withinWindow(autoStamps, now)
+    let isAuto = await read($, autoAtom)
+    if (isAuto && autoStamps.length >= RATE_LIMIT) {
+      await update($, autoAtom, () => false)
+      isAuto = false
+      $.ui.toast(
+        `Session bridge: ${RATE_LIMIT}+ auto-delivered messages in 5 minutes, switched to manual. /bridge-auto on to resume.`,
+        { timeoutMs: 10_000 },
+      )
+    }
+
+    if (isAuto) {
+      autoStamps.push(now)
+      await markDelivered($, new Set(claimed.map(m => m.id)))
+      $.ui.toast(`Session bridge: ${claimed.length} message${claimed.length === 1 ? '' : 's'} from ${senders}`)
+      void $.prompt.submit({ text: formatPrompt(claimed) })
+    } else {
+      $.ui.toast(`Session bridge: ${claimed.length} new from ${senders}. /bridge-inbox to read.`)
+    }
+  } finally {
+    isPolling = false
+    await showStatus($).catch(() => undefined)
+  }
+}
+
+/** Writes a message into each inbox: temp file first, then a rename, so a reader never sees half of it. */
+async function send(
+  $: $,
+  to: string,
+  draft: { kind: BridgeKind; body: string; subject?: string; replyTo?: string; handoffPath?: string },
+): Promise<{ ok: true; text: string; message: BridgeMessage } | { ok: false; reason: string }> {
+  const self = await me($)
+  const now = await $.clock.now()
+  const resolved = resolveTarget(to, await readPeers($), self, now)
+  if (resolved.kind === 'error') return { ok: false, reason: resolved.reason }
+  if (draft.body.trim() === '') return { ok: false, reason: 'The message is empty.' }
+
+  const names = resolved.kind === 'live' ? resolved.names : [resolved.name]
+  const message: BridgeMessage = {
+    id: newMessageId(now, Math.random()),
+    kind: draft.kind,
+    from: { id: self.id, name: self.name, role: self.role, cwd: self.cwd },
+    to: names.join(','),
+    body: draft.body,
+    createdAt: now,
+    ...(draft.subject ? { subject: draft.subject } : {}),
+    ...(draft.replyTo ? { replyTo: draft.replyTo } : {}),
+    ...(draft.handoffPath ? { handoffPath: draft.handoffPath } : {}),
+  }
+  for (const name of names) {
+    const inbox = dirs.inbox(name)
+    const temp = `${inbox}/.${message.id}.tmp`
+    await $.fs.write(temp, JSON.stringify({ ...message, to: name }))
+    if (!(await sh($, ['mv', temp, `${inbox}/${message.id}.json`]))) {
+      return { ok: false, reason: `Could not place the message in ${inbox}.` }
+    }
+  }
+  await appendLog($, [{ direction: 'out', message, isDelivered: true }])
+
+  const text =
+    resolved.kind === 'live'
+      ? `Sent ${message.kind} ${message.id} to ${names.join(', ')}.`
+      : `No live session is named "${resolved.name}". The ${message.kind} (${message.id}) is queued and will be delivered when a session takes that name (/bridge-name ${resolved.name}).`
+  return { ok: true, text, message }
+}
+
+async function gitSummary($: $) {
+  try {
+    const run = await $.process.run(['git', 'status', '--short', '--branch'], { timeoutMs: 10_000 })
+    if (run.exitCode !== 0) return undefined
+    const [branch = '', ...changes] = run.stdout.trim().split('\n')
+    return `${branch.replace(/^## /, '')}; ${changes.filter(Boolean).length} changed path(s)`
+  } catch {
+    return undefined
+  }
+}
+
+async function transcriptTail($: $, count: number) {
+  if (count <= 0) return undefined
+  const messages = await $.session.messages()
+  if (!Array.isArray(messages)) return undefined
+  return messages
+    .slice(-count)
+    .map(m => `**${m.role}:** ${clip(m.text.trim() || '(tool use only)', 2_000)}`)
+    .join('\n\n')
+}
+
+async function handoff(
+  $: $,
+  to: string,
+  input: { title: string; summary: string; nextSteps: string; files: string[]; transcriptCount: number },
+) {
+  const self = await me($)
+  const now = await $.clock.now()
+  const id = newMessageId(now, Math.random())
+  const doc = formatHandoff({
+    title: input.title,
+    summary: input.summary,
+    nextSteps: input.nextSteps,
+    files: input.files,
+    from: self,
+    to,
+    createdAt: now,
+    git: await gitSummary($),
+    transcript: await transcriptTail($, input.transcriptCount),
+  })
+  const path = `${dirs.handoffs()}/${id}.md`
+  await $.fs.write(path, doc)
+  return send($, to, {
+    kind: 'handoff',
+    subject: input.title,
+    body: handoffBody(doc, path),
+    handoffPath: path,
+  })
+}
+
+async function setIdentity($: $, rawName: string | undefined, rawRole: string | undefined) {
+  const self = await me($)
+  const name = rawName === undefined || rawName.trim() === '' ? self.name : sanitizeName(rawName)
+  const role = rawRole === undefined || rawRole.trim() === '' ? self.role : sanitizeName(rawRole) || self.role
+  if (name === '') return { ok: false as const, reason: `"${rawName}" is not a usable name.` }
+
+  const now = await $.clock.now()
+  const taken = (await readPeers($)).find(p => p.name === name && p.id !== self.id && isLive(p, now))
+  if (taken) return { ok: false as const, reason: `"${name}" is already used by live session ${taken.id.slice(0, 8)} in ${taken.cwd}.` }
+
+  await update($, meAtom, () => ({ ...self, name, role }))
+  await $.store.set(`identity:${self.id}`, { name, role })
+  await sh($, ['mkdir', '-p', dirs.inbox(name), dirs.archive(name)])
+  await heartbeat($)
+  await poll($)
+  return { ok: true as const, text: `This session is now "${name}" (role: ${role}).` }
+}
+
+async function describe($: $) {
+  return describePeers(await me($), await readPeers($), await $.clock.now())
+}
+
+const args = (e: object) => e as unknown as Record<string, unknown>
+const str = (value: unknown) => (typeof value === 'string' ? value : undefined)
+
+export const register: Register = (on, options) => {
+  on('session.start', async ($, e, next) => {
+    const started = await next(e)
+
+    const home = (await $.env.get('HOME')) ?? ''
+    root = (await $.env.get('CLAUDE_SESSION_BRIDGE_DIR')) ?? `${home}/.claude/session-bridge`
+
+    const id = await $.session.id()
+    const stored = (await $.store.get(`identity:${id}`)) as Identity | undefined
+    const self: BridgePeer = {
+      id,
+      name: stored?.name ?? defaultName(e.cwd, id),
+      role: stored?.role ?? 'general',
+      cwd: e.cwd,
+      updatedAt: await $.clock.now(),
+    }
+    // A reload keeps the identity the session already took, and its auto setting.
+    const held = await read($, meAtom)
+    await update($, meAtom, () => (held !== null && held.id === id ? held : self))
+    const { version } = await $.state.get({ plugin: 'session-bridge', key: 'isAuto' } as const)
+    if (version === 0) await update($, autoAtom, () => options.autoDeliver !== false)
+
+    const name = (await me($)).name
+    await sh($, ['mkdir', '-p', dirs.sessions(), dirs.handoffs(), dirs.inbox(name), dirs.archive(name)])
+
+    await Promise.all([
+      $.tool.register({
+        name: 'bridge_peers',
+        description:
+          'Session bridge: list the other Claude Code sessions running on this machine that you can message (name, role, working directory), and this session\'s own name and role.',
+        inputSchema: { type: 'object', properties: {} },
+        isDeferred: false,
+      }),
+      $.tool.register({
+        name: 'bridge_send',
+        description:
+          'Session bridge: send a message to another running Claude Code session (by name from bridge_peers, or "*" for all live peers). Use it to coordinate: ask a planner a question, report a result to the builder, request a review from an auditor, or reply to a peer message (set reply_to). Messages to a name with no live session are queued until a session takes that name. Do not send acknowledgements.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            to: { type: 'string', description: 'Recipient session name, a session-id prefix, or "*" for every live peer.' },
+            body: { type: 'string', description: 'The message. Be specific and self-contained: the recipient cannot see your conversation.' },
+            kind: { type: 'string', enum: ['message', 'question', 'reply', 'review-request', 'status'], description: 'Default "message".' },
+            subject: { type: 'string', description: 'Optional one-line subject.' },
+            reply_to: { type: 'string', description: 'The id of the peer message this answers.' },
+          },
+          required: ['to', 'body'],
+        },
+        isDeferred: false,
+      }),
+      $.tool.register({
+        name: 'bridge_handoff',
+        description:
+          'Session bridge: hand off work to another session with a written context document (saved under ~/.claude/session-bridge/handoffs and delivered to the recipient). Use when another session should continue, implement, or audit what you planned or built. Write the summary so a fresh session with no access to your conversation can act on it.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            to: { type: 'string', description: 'Recipient session name, or "*".' },
+            title: { type: 'string', description: 'One-line title of the work being handed off.' },
+            summary: { type: 'string', description: 'Goal, decisions made, current state, constraints and gotchas.' },
+            next_steps: { type: 'string', description: 'What the recipient should do, in order, and how to verify it.' },
+            files: { type: 'array', items: { type: 'string' }, description: 'Relevant file paths.' },
+            transcript_messages: { type: 'number', description: 'Also attach this many of the latest transcript messages (0-40, default 0).' },
+          },
+          required: ['to', 'title', 'summary', 'next_steps'],
+        },
+        isDeferred: false,
+      }),
+      $.tool.register({
+        name: 'bridge_inbox',
+        description:
+          'Session bridge: read peer messages that arrived but have not been shown to you yet (when auto-delivery is off), plus the last few exchanged.',
+        inputSchema: { type: 'object', properties: {} },
+        isDeferred: false,
+      }),
+      $.tool.register({
+        name: 'bridge_identify',
+        description:
+          'Session bridge: set this session\'s name and/or role on the bridge (e.g. name "planner", role "plan"; or "builder"/"build", "auditor"/"audit"). Do this when the user tells you which part you play.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: 'Short unique name: letters, digits, ".", "_" or "-".' },
+            role: { type: 'string', description: 'What this session does, e.g. plan, build, audit, review.' },
+          },
+        },
+        isDeferred: false,
+      }),
+      $.command.register({ name: 'bridge', description: 'Session bridge: show peers and recent messages in a pane' }),
+      $.command.register({ name: 'bridge-name', description: 'Session bridge: name this session (and set its role)', argumentHint: '<name> [role]' }),
+      $.command.register({ name: 'bridge-send', description: 'Session bridge: send a message to another session', argumentHint: '<name|*> <message>' }),
+      $.command.register({ name: 'bridge-handoff', description: 'Session bridge: summarize this conversation and hand it to another session', argumentHint: '<name|*> [instructions for the recipient]' }),
+      $.command.register({ name: 'bridge-inbox', description: 'Session bridge: read unread peer messages (and pass them to the model)' }),
+      $.command.register({ name: 'bridge-auto', description: 'Session bridge: auto-deliver peer messages as turns, or only notify', argumentHint: '[on|off]' }),
+    ])
+
+    await heartbeat($)
+    $.clock.every(10_000, () => void heartbeat($).catch(error => $.ui.log(`session-bridge heartbeat: ${error}`, { to: 'debug' })))
+    $.clock.every(2_000, () => void poll($).catch(error => $.ui.log(`session-bridge poll: ${error}`, { to: 'debug' })))
+    void poll($)
+
+    return started
+  })
+
+  on('session.end', async ($, e, next) => {
+    // A /clear keeps the process (and its identity) alive under a new id; the heartbeat moves it.
+    if (e.reason !== 'clear' && root !== '') {
+      await sh($, ['rm', '-f', `${dirs.sessions()}/${e.sessionId}.json`])
+    }
+    return next(e)
+  })
+
+  // ---- tools the model calls ----
+
+  on('tool.call', { tool: 'mcp__session-bridge__bridge_peers' }, async $ => ({ result: await describe($) })).catch(TOOL_FAILED)
+
+  on('tool.call', { tool: 'mcp__session-bridge__bridge_send' }, async ($, e) => {
+    const a = args(e)
+    const sent = await send($, str(a.to) ?? '', {
+      kind: asKind(a.kind),
+      body: str(a.body) ?? '',
+      subject: str(a.subject),
+      replyTo: str(a.reply_to),
+    })
+    return sent.ok ? { result: sent.text } : { deny: sent.reason }
+  }).catch(TOOL_FAILED)
+
+  on('tool.call', { tool: 'mcp__session-bridge__bridge_handoff' }, async ($, e) => {
+    const a = args(e)
+    const count = typeof a.transcript_messages === 'number' ? a.transcript_messages : 0
+    const sent = await handoff($, str(a.to) ?? '', {
+      title: str(a.title) ?? 'Handoff',
+      summary: str(a.summary) ?? '',
+      nextSteps: str(a.next_steps) ?? '',
+      files: Array.isArray(a.files) ? a.files.filter((f): f is string => typeof f === 'string') : [],
+      transcriptCount: Math.max(0, Math.min(40, Math.floor(count))),
+    })
+    return sent.ok ? { result: `${sent.text} Document: ${sent.message.handoffPath}` } : { deny: sent.reason }
+  }).catch(TOOL_FAILED)
+
+  on('tool.call', { tool: 'mcp__session-bridge__bridge_inbox' }, async $ => {
+    const fresh = await unread($)
+    await markDelivered($, new Set(fresh.map(m => m.id)))
+    await showStatus($)
+    if (fresh.length > 0) return { result: formatPrompt(fresh) }
+    const recent = (await read($, logAtom)).slice(-5)
+    return {
+      result:
+        recent.length === 0
+          ? 'No messages yet.'
+          : `No unread messages. Last ${recent.length} exchanged:\n\n${recent
+              .map(l => `${l.direction === 'in' ? 'received' : 'sent'}: ${clip(formatDelivery(l.message), 1_500)}`)
+              .join('\n\n')}`,
+    }
+  }).catch(TOOL_FAILED)
+
+  on('tool.call', { tool: 'mcp__session-bridge__bridge_identify' }, async ($, e) => {
+    const a = args(e)
+    const set = await setIdentity($, str(a.name), str(a.role))
+    return set.ok ? { result: set.text } : { deny: set.reason }
+  }).catch(TOOL_FAILED)
+
+  // ---- slash commands the person runs ----
+
+  on('command.run', { command: 'bridge' }, async $ => {
+    await $.ui.open({ id: PANE, title: 'Session bridge' })
+    return { text: await describe($) }
+  })
+
+  on('command.run', { command: 'bridge-name' }, async ($, e) => {
+    const [name, role] = e.args.trim().split(/\s+/)
+    if (!name) return { text: `${await describe($)}\n\nUsage: /bridge-name <name> [role]` }
+    const set = await setIdentity($, name, role)
+    return { text: set.ok ? set.text : set.reason }
+  })
+
+  on('command.run', { command: 'bridge-send' }, async ($, e) => {
+    const { to, text } = splitTarget(e.args)
+    if (!to || !text) return { text: 'Usage: /bridge-send <name|*> <message>' }
+    const sent = await send($, to, { kind: 'message', body: text })
+    return { text: sent.ok ? sent.text : sent.reason }
+  })
+
+  on('command.run', { command: 'bridge-handoff' }, async ($, e) => {
+    const { to, text: notes } = splitTarget(e.args)
+    if (!to) return { text: 'Usage: /bridge-handoff <name|*> [instructions for the recipient]' }
+    $.ui.toast('Session bridge: writing the handoff…')
+    const written = await $.model.fork({
+      prompt: [
+        'Write a handoff document so a fresh Claude Code session, with no access to this conversation, can continue the work.',
+        'Markdown only, no preamble. Start with one line "TITLE: <short title>". Then sections:',
+        '## Goal, ## Done so far, ## Current state (uncommitted changes, open questions, decisions and why), ## Next steps (numbered, with how to verify), ## Relevant files (paths).',
+        'Be concrete: exact paths, commands, names. Keep it under 1500 words.',
+        notes ? `Instructions from the user for the recipient: ${notes}` : '',
+      ]
+        .filter(Boolean)
+        .join('\n'),
+    })
+    if (!written.isAnswered) return { text: `Could not write the handoff (${written.reason}).` }
+
+    const titleLine = /^TITLE:\s*(.+)$/m.exec(written.text)
+    const title = titleLine?.[1]?.trim() ?? 'Context handoff'
+    const summary = written.text.replace(/^TITLE:.*\n?/m, '').trim()
+    const sent = await handoff($, to, {
+      title,
+      summary: notes ? `${summary}\n\n## Instructions from the user\n\n${notes}` : summary,
+      nextSteps: '',
+      files: [],
+      transcriptCount: 0,
+    })
+    return { text: sent.ok ? `${sent.text}\nDocument: ${sent.message.handoffPath}` : sent.reason }
+  })
+
+  on('command.run', { command: 'bridge-inbox' }, async $ => {
+    const fresh = await unread($)
+    if (fresh.length === 0) return { text: 'No unread peer messages.' }
+    await markDelivered($, new Set(fresh.map(m => m.id)))
+    await showStatus($)
+    const shown = fresh
+      .map(m => `[${m.kind}] from ${m.from.name}${m.subject ? `: ${m.subject}` : ''}\n${clip(m.body, 1_200)}`)
+      .join('\n\n')
+    return { text: shown, context: [formatPrompt(fresh)] }
+  })
+
+  on('command.run', { command: 'bridge-auto' }, async ($, e) => {
+    const word = e.args.trim().toLowerCase()
+    const isAuto = word === '' ? !(await read($, autoAtom)) : word === 'on' || word === 'true'
+    await update($, autoAtom, () => isAuto)
+    autoStamps = []
+    await showStatus($)
+    if (isAuto) void poll($)
+    return {
+      text: isAuto
+        ? 'Peer messages are submitted to the model as soon as this session is idle.'
+        : 'Peer messages only notify; read them with /bridge-inbox.',
+    }
+  })
+
+  // ---- the pane ----
+
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const self = await read($, meAtom)
+    const peers = await read($, peersAtom)
+    const log = await read($, logAtom)
+    const isAuto = await read($, autoAtom)
+    const now = await $.clock.now()
+    const width = Math.max(20, e.props.bodyColumns ?? 60)
+    const live = peers.filter(p => self !== null && p.id !== self.id && isLive(p, now))
+    const room = Math.max(3, (e.viewport?.rows ?? 30) - live.length - 10)
+
+    return (
+      <Box flexDirection="column">
+        <Text bold>
+          {self === null ? 'Starting…' : `${self.name} · role ${self.role}`}
+        </Text>
+        <Box>
+          <Text dimColor>{isAuto ? 'Auto-delivery on ' : 'Manual (notify only) '}</Text>
+          <Button key="auto" label={isAuto ? 'Switch to manual' : 'Switch to auto'} onPress={() => update($, autoAtom, v => !v)} />
+        </Box>
+        <Text> </Text>
+        <Text bold>Peers</Text>
+        {live.length === 0 && <Text dimColor>No other live sessions.</Text>}
+        {live.map(p => (
+          <Text>
+            {clip(`• ${p.name} (${p.role}) ${p.cwd}`, width - 2)}
+          </Text>
+        ))}
+        <Text> </Text>
+        <Text bold>Messages</Text>
+        {log.length === 0 && <Text dimColor>None yet.</Text>}
+        {log.slice(-room).map(l => (
+          <Text dimColor={l.direction === 'out' || l.isDelivered}>
+            {clip(
+              `${l.direction === 'in' ? '←' : '→'} ${l.direction === 'in' ? l.message.from.name : l.message.to} [${l.message.kind}] ${l.message.subject ?? l.message.body.replace(/\s+/g, ' ')}`,
+              width - 2,
+            )}
+          </Text>
+        ))}
+      </Box>
+    )
+  })
+}
+
