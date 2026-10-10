@@ -1,0 +1,6 @@
+{
+  "name": "next-steps",
+  "description": "Suggested next steps as buttons above the Claude Code prompt.",
+  "owner": { "name": "iddhi" },
+  "plugins": [{ "name": "next-steps", "source": "./" }]
+}

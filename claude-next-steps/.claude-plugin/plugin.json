@@ -1,0 +1,31 @@
+{
+  "name": "next-steps",
+  "version": "0.1.0",
+  "description": "After each reply, shows suggested next steps as buttons above the prompt (press 1-4 or click).",
+  "author": {
+    "name": "iddhi"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "source": {
+      "type": "string",
+      "title": "Suggestion source",
+      "description": "quick: Haiku reads your last prompt and Claude's reply (cheap, fast). full: forks the whole conversation on the session's model (better, costs more).",
+      "default": "quick",
+      "options": [
+        "quick",
+        "full"
+      ]
+    },
+    "onPress": {
+      "type": "string",
+      "title": "When a button is pressed",
+      "description": "submit: send the step as your next prompt. fill: put it in the prompt box to edit first.",
+      "default": "submit",
+      "options": [
+        "submit",
+        "fill"
+      ]
+    }
+  }
+}
