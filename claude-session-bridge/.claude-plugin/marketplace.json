@@ -1,0 +1,13 @@
+{
+  "name": "session-bridge",
+  "description": "Cross-session messaging and context handoff for Claude Code.",
+  "owner": {
+    "name": "iddhi"
+  },
+  "plugins": [
+    {
+      "name": "session-bridge",
+      "source": "./"
+    }
+  ]
+}
