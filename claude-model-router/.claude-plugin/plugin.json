@@ -1,0 +1,84 @@
+{
+  "name": "model-router",
+  "version": "0.1.0",
+  "description": "Classifies each turn as mechanical, ordinary or hard and routes it to a matching model and reasoning effort, logging every decision.",
+  "author": {
+    "name": "iddhi"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "routeEffort": {
+      "type": "boolean",
+      "title": "Route reasoning effort",
+      "description": "Lower effort for confidently mechanical turns and raise it for hard ones. A top-level effort change invalidates the cached messages for that request.",
+      "default": true
+    },
+    "switchMainModel": {
+      "type": "boolean",
+      "title": "Switch the main model",
+      "description": "Send each turn to its tier's model (hard → Opus 5.5, ordinary → Sonnet 5.5, mechanical → Haiku 5.5). Off by default: the prompt cache is per model, so every switch re-reads the whole conversation uncached.",
+      "default": false
+    },
+    "cheapModel": {
+      "type": "string",
+      "title": "Cheap model",
+      "description": "Model for mechanical turns when main-model switching is on: the bottom rung of the Opus → Sonnet → Haiku ladder.",
+      "default": "claude-haiku-5-5"
+    },
+    "ordinaryModel": {
+      "type": "string",
+      "title": "Ordinary model",
+      "description": "Model for ordinary turns when main-model switching is on: the middle rung.",
+      "default": "claude-sonnet-5-5"
+    },
+    "strongModel": {
+      "type": "string",
+      "title": "Strong model",
+      "description": "Model for hard turns when main-model switching is on: the top rung. Nothing above Opus is ever used.",
+      "default": "claude-opus-5-5"
+    },
+    "classifier": {
+      "type": "string",
+      "title": "Classifier",
+      "description": "laya: the local Laya decision server (no API cost, ~0.5s warm). model: a Claude model (classifierModel).",
+      "options": [
+        "laya",
+        "model"
+      ],
+      "default": "laya"
+    },
+    "layaUrl": {
+      "type": "string",
+      "title": "Laya server URL",
+      "description": "Base URL of laya-serve; the router posts to <url>/v1/systemone.",
+      "default": "http://127.0.0.1:8765"
+    },
+    "classifierModel": {
+      "type": "string",
+      "title": "Classifier model",
+      "description": "Claude model that classifies each turn when classifier is \"model\".",
+      "default": "haiku"
+    },
+    "mechanicalEffort": {
+      "type": "string",
+      "title": "Effort for mechanical turns",
+      "description": "Never raises effort: applied only when it is below the session's.",
+      "options": [
+        "low",
+        "medium"
+      ],
+      "default": "low"
+    },
+    "hardEffort": {
+      "type": "string",
+      "title": "Effort for hard turns",
+      "description": "Never lowers effort: applied only when it is above the session's.",
+      "options": [
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default": "xhigh"
+    }
+  }
+}
