@@ -1,0 +1,10 @@
+{
+  "name": "claude-mods",
+  "description": "Mods for Claude Code: next-step buttons, cross-session messaging and per-turn model routing.",
+  "owner": { "name": "iddhi" },
+  "plugins": [
+    { "name": "next-steps", "source": "./claude-next-steps" },
+    { "name": "session-bridge", "source": "./claude-session-bridge" },
+    { "name": "model-router", "source": "./claude-model-router" }
+  ]
+}

@@ -77,7 +77,8 @@ claude -p "…" --plugin-dir .      # one-off run without installing
 
 ## Install
 
+In a Claude Code terminal session:
+
 ```
-claude plugin marketplace add ~/Codes/claude-model-router
-claude plugin install model-router@model-router --scope user
+/plugin install model-router --marketplace iddhi-sulakshana/claude-mods
 ```

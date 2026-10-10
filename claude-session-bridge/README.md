@@ -62,14 +62,11 @@ The status line shows `⇄ <name> (<role>) · N peers · M unread`.
 
 ## Install
 
-The plugin is installed globally from this folder, which is a local marketplace:
+In a Claude Code terminal session:
 
 ```
-claude plugin marketplace add ~/Codes/claude-session-bridge
-claude plugin install session-bridge@session-bridge --scope user
+/plugin install session-bridge --marketplace iddhi-sulakshana/claude-mods
 ```
-
-Claude Code reads the plugin straight from this folder. After you edit it, run `/reload-plugins` in a session.
 
 You can configure it in `/config` → `session-bridge.autoDeliver` (default `true`).
 
