@@ -3,13 +3,18 @@ import type { On } from 'claude-code'
 
 import type { BridgeMessage, BridgePeer } from '../types'
 import {
+  cmuxArgv,
+  cmuxFromEnv,
   defaultName,
   formatPeerText,
   formatPrompt,
   parseDelivery,
+  parseSpawn,
   resolveTarget,
   sanitizeName,
+  spawnCommand,
   splitTarget,
+  tabTitle,
 } from '../hooks/bridge'
 
 const ROOT = '/bridge'
@@ -49,14 +54,15 @@ describe('helpers', () => {
 })
 
 /** An in-memory file system, process table and session channel beneath the plugin. */
-function world(on: On) {
+function world(on: On, extraEnv: Record<string, string> = {}) {
   const files = new Map<string, string>()
+  const cmuxCalls: string[][] = []
   const submitted: string[] = []
   const sent: { to: string; text: string }[] = []
   let refusal: string | undefined
   let sessionId = ME
 
-  mock.env(on, { HOME: '/home', CLAUDE_SESSION_BRIDGE_DIR: ROOT })
+  mock.env(on, { HOME: '/home', CLAUDE_SESSION_BRIDGE_DIR: ROOT, ...extraEnv })
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
@@ -109,6 +115,10 @@ function world(on: On) {
   const done = (exitCode: number) => ({ exitCode, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false })
   const run = (argv: readonly string[]) => {
     const [command, ...rest] = argv
+    if (command === 'cmux') {
+      cmuxCalls.push([...argv])
+      return done(0)
+    }
     if (command === 'mv') {
       const [from = '', to = ''] = rest
       const text = files.get(from)
@@ -130,6 +140,7 @@ function world(on: On) {
 
   return {
     files,
+    cmuxCalls,
     submitted,
     sent,
     refuse: (reason: string) => {
@@ -394,4 +405,204 @@ test('a direct delivery reads back as the message it carries', () => {
   const text = `Another Claude session sent a message:\n${formatPeerText(message)}`
   expect(parseDelivery(text, 'app-aaaa')).toEqual({ ...message, from: { ...message.from, id: '' } })
   expect(parseDelivery('just text', 'app-aaaa')).toBeUndefined()
+})
+
+const CMUX_ENV = { CMUX_WORKSPACE_ID: 'WS-1111', CMUX_SURFACE_ID: 'SF-2222' }
+
+describe('cmux helpers', () => {
+  test('cmux is detected from its environment, and only there', () => {
+    expect(cmuxFromEnv(() => undefined)).toBeUndefined()
+    expect(cmuxFromEnv(key => ({ CMUX_WORKSPACE_ID: 'W' })[key])).toEqual({ workspace: 'W' })
+    expect(cmuxFromEnv(key => ({ CMUX_WORKSPACE_ID: 'W', CMUX_PANEL_ID: 'P' })[key])).toEqual({ workspace: 'W', surface: 'P' })
+    expect(cmuxFromEnv(key => ({ CMUX_WORKSPACE_ID: 'W', CMUX_SURFACE_ID: 'S', CMUX_PANEL_ID: 'P' })[key])).toEqual({
+      workspace: 'W',
+      surface: 'S',
+    })
+  })
+
+  test('cmux commands name the workspace and surface', () => {
+    const ref = { workspace: 'W', surface: 'S' }
+    expect(cmuxArgv.notify(ref, 'T', 'B')).toEqual(['cmux', 'notify', '--title', 'T', '--body', 'B', '--workspace', 'W', '--surface', 'S'])
+    expect(cmuxArgv.renameTab(ref, 'planner')).toEqual(['cmux', 'rename-tab', '--workspace', 'W', '--surface', 'S', 'planner'])
+    expect(cmuxArgv.renameTab({ workspace: 'W' }, 'planner')).toBeUndefined()
+    expect(cmuxArgv.focus(ref)[0]).toEqual(['cmux', 'select-workspace', '--workspace', 'W'])
+    expect(tabTitle('planner', 'plan')).toBe('planner (plan)')
+    expect(tabTitle('planner', 'general')).toBe('planner')
+  })
+
+  test('a spawned session gets its name and role in the environment, and permissions off only when asked', () => {
+    expect(spawnCommand({ name: 'builder', role: 'build', skipPermissions: false })).toBe(
+      'CLAUDE_SESSION_BRIDGE_NAME=builder CLAUDE_SESSION_BRIDGE_ROLE=build claude',
+    )
+    expect(spawnCommand({ name: 'builder', role: 'build', skipPermissions: true })).toContain('--dangerously-skip-permissions')
+  })
+
+  test('the spawned command is configurable and may read a key file when the shell runs it', () => {
+    const command = 'ANTHROPIC_BASE_URL=https://example.test ANTHROPIC_API_KEY="$(cat ~/.config/some.key)" claude'
+    const text = spawnCommand({ name: 'builder', role: 'build', skipPermissions: true, command })
+    expect(text).toBe(
+      `CLAUDE_SESSION_BRIDGE_NAME=builder CLAUDE_SESSION_BRIDGE_ROLE=build ${command} --dangerously-skip-permissions`,
+    )
+    expect(spawnCommand({ name: 'b', role: 'r', skipPermissions: false, command: '  ' })).toContain(' claude')
+    expect(spawnCommand({ name: 'b', role: 'r', skipPermissions: false, command: 'one\ntwo' })).toContain('one two')
+    expect(spawnCommand({ name: 'b', role: 'r', skipPermissions: false, command: 'tclaude' })).not.toContain('--dangerously')
+  })
+
+  test('/bridge-spawn arguments split into name, role, flag and first message', () => {
+    expect(parseSpawn('builder build --skip-permissions -- do the thing -- twice')).toEqual({
+      name: 'builder',
+      role: 'build',
+      skipPermissions: true,
+      message: 'do the thing -- twice',
+    })
+    expect(parseSpawn('auditor')).toEqual({ name: 'auditor', role: '', skipPermissions: false, message: '' })
+  })
+})
+
+describe('the bridge in cmux', () => {
+  const start = ($: any) => $.session.start({ cwd: '/work/app', surface: 'terminal', isInteractive: true })
+
+  test('the peer file records the cmux workspace, and the sidebar shows the bridge', async ($, on) => {
+    mock.clock(on, { now: NOW })
+    mock.store(on)
+    const { files, cmuxCalls } = world(on, CMUX_ENV)
+    await start($)
+    const me = JSON.parse(files.get(`${ROOT}/sessions/${ME}.json`) ?? '{}') as BridgePeer
+    expect(me.cmux).toEqual({ workspace: 'WS-1111', surface: 'SF-2222' })
+    expect(cmuxCalls.some(c => c[1] === 'ping')).toBe(true)
+    const status = cmuxCalls.find(c => c[1] === 'set-status')
+    expect(status?.slice(0, 3)).toEqual(['cmux', 'set-status', 'bridge'])
+    expect(status?.[3]).toContain('app-aaaa')
+  })
+
+  test('outside cmux nothing calls cmux', async ($, on) => {
+    mock.clock(on, { now: NOW })
+    mock.store(on)
+    const { files, cmuxCalls } = world(on)
+    await start($)
+    expect(cmuxCalls).toEqual([])
+    expect((JSON.parse(files.get(`${ROOT}/sessions/${ME}.json`) ?? '{}') as BridgePeer).cmux).toBeUndefined()
+  })
+
+  test('the cmux option off ignores cmux even inside it', { options: { cmux: false } }, async ($, on) => {
+    mock.clock(on, { now: NOW })
+    mock.store(on)
+    const { files, cmuxCalls } = world(on, CMUX_ENV)
+    await start($)
+    expect(cmuxCalls).toEqual([])
+    expect((JSON.parse(files.get(`${ROOT}/sessions/${ME}.json`) ?? '{}') as BridgePeer).cmux).toBeUndefined()
+  })
+
+  test('a held message raises a cmux notification', async ($, on) => {
+    mock.clock(on, { now: NOW })
+    mock.store(on)
+    const { cmuxCalls } = world(on, CMUX_ENV)
+    await start($)
+    await $.command.run({ command: 'bridge-auto', args: 'off' } as never)
+    await $.session.receive({
+      agentId: undefined,
+      origin: { kind: 'peer', plugin: 'session-bridge' },
+      text: formatPeerText(incoming({ id: `${NOW}-zzz999` })),
+    } as never)
+    const note = cmuxCalls.find(c => c[1] === 'notify')
+    expect(note).toBeDefined()
+    expect(note?.join(' ')).toContain('planner')
+    expect(note?.join(' ')).toContain('/bridge-inbox')
+  })
+
+  test('naming the session renames its cmux tab', async ($, on) => {
+    mock.clock(on, { now: NOW })
+    mock.store(on)
+    const { cmuxCalls } = world(on, CMUX_ENV)
+    await start($)
+    await $.tool.call({ tool: 'mcp__session-bridge__bridge_identify', name: 'builder', role: 'build' } as never)
+    expect(cmuxCalls.find(c => c[1] === 'rename-tab')).toEqual(['cmux', 'rename-tab', '--workspace', 'WS-1111', '--surface', 'SF-2222', 'builder (build)'])
+  })
+
+  test('a session started with a name in its environment takes it', async ($, on) => {
+    mock.clock(on, { now: NOW })
+    mock.store(on)
+    const { files, cmuxCalls } = world(on, { ...CMUX_ENV, CLAUDE_SESSION_BRIDGE_NAME: 'Builder', CLAUDE_SESSION_BRIDGE_ROLE: 'build' })
+    await start($)
+    const me = JSON.parse(files.get(`${ROOT}/sessions/${ME}.json`) ?? '{}') as BridgePeer
+    expect([me.name, me.role]).toEqual(['builder', 'build'])
+    expect(cmuxCalls.some(c => c[1] === 'rename-tab' && c.at(-1) === 'builder (build)')).toBe(true)
+  })
+
+  test('bridge_spawn opens a workspace running claude with the name, and queues the first message', async ($, on) => {
+    mock.clock(on, { now: NOW })
+    mock.store(on)
+    const { files, cmuxCalls } = world(on, CMUX_ENV)
+    await start($)
+    const result = await $.tool.call({
+      tool: 'mcp__session-bridge__bridge_spawn',
+      name: 'Builder',
+      role: 'build',
+      cwd: '/work/other',
+      message: 'Implement step 1.',
+    } as never)
+    expect(result.deny).toBeUndefined()
+    const made = cmuxCalls.find(c => c[1] === 'new-workspace')
+    expect(made).toEqual([
+      'cmux', 'new-workspace', '--cwd', '/work/other', '--command',
+      'CLAUDE_SESSION_BRIDGE_NAME=builder CLAUDE_SESSION_BRIDGE_ROLE=build claude',
+    ])
+    expect(inboxFiles(files, 'builder').length).toBe(1)
+    expect(String(result.result)).not.toContain('permission prompts OFF')
+  })
+
+  test('bridge_spawn runs the configured spawnCommand option', { options: { spawnCommand: 'tclaude' } }, async ($, on) => {
+    mock.clock(on, { now: NOW })
+    mock.store(on)
+    const { cmuxCalls } = world(on, CMUX_ENV)
+    await start($)
+    await $.tool.call({ tool: 'mcp__session-bridge__bridge_spawn', name: 'builder' } as never)
+    const made = cmuxCalls.find(c => c[1] === 'new-workspace')
+    expect(made?.at(-1)).toBe('CLAUDE_SESSION_BRIDGE_NAME=builder CLAUDE_SESSION_BRIDGE_ROLE=general tclaude')
+  })
+
+  test('bridge_spawn turns permission prompts off only when asked', async ($, on) => {
+    mock.clock(on, { now: NOW })
+    mock.store(on)
+    const { cmuxCalls } = world(on, CMUX_ENV)
+    await start($)
+    const result = await $.tool.call({ tool: 'mcp__session-bridge__bridge_spawn', name: 'rogue', skip_permissions: true } as never)
+    expect(cmuxCalls.find(c => c[1] === 'new-workspace')?.at(-1)).toContain('--dangerously-skip-permissions')
+    expect(String(result.result)).toContain('permission prompts OFF')
+  })
+
+  test('bridge_spawn refuses a name a live session already has', async ($, on) => {
+    mock.clock(on, { now: NOW })
+    mock.store(on)
+    const { files, cmuxCalls } = world(on, CMUX_ENV)
+    files.set(`${ROOT}/sessions/bbbb2222-0000.json`, JSON.stringify(peer({})))
+    await start($)
+    const result = await $.tool.call({ tool: 'mcp__session-bridge__bridge_spawn', name: 'planner' } as never)
+    expect(result.deny).toContain('already used')
+    expect(cmuxCalls.some(c => c[1] === 'new-workspace')).toBe(false)
+  })
+
+  test('bridge_spawn is not offered outside cmux', async ($, on) => {
+    mock.clock(on, { now: NOW })
+    mock.store(on)
+    const { cmuxCalls } = world(on)
+    await start($)
+    const result = await $.tool.call({ tool: 'mcp__session-bridge__bridge_spawn', name: 'builder' } as never)
+    expect(result.deny).toBeDefined()
+    expect(cmuxCalls).toEqual([])
+  })
+
+  test('bridge_focus switches cmux to a peer that runs in cmux, and refuses one that does not', async ($, on) => {
+    mock.clock(on, { now: NOW })
+    mock.store(on)
+    const { files, cmuxCalls } = world(on, CMUX_ENV)
+    files.set(`${ROOT}/sessions/bbbb2222-0000.json`, JSON.stringify(peer({ cmux: { workspace: 'WS-9999', surface: 'SF-8888' } })))
+    files.set(`${ROOT}/sessions/cccc3333-0000.json`, JSON.stringify(peer({ id: 'cccc3333-0000', name: 'plain' })))
+    await start($)
+    const ok = await $.tool.call({ tool: 'mcp__session-bridge__bridge_focus', name: 'planner' } as never)
+    expect(ok.deny).toBeUndefined()
+    expect(cmuxCalls.find(c => c[1] === 'select-workspace')).toEqual(['cmux', 'select-workspace', '--workspace', 'WS-9999'])
+    const no = await $.tool.call({ tool: 'mcp__session-bridge__bridge_focus', name: 'plain' } as never)
+    expect(no.deny).toContain('does not run in cmux')
+  })
 })

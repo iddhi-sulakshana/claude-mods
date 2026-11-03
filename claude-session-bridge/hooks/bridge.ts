@@ -1,7 +1,7 @@
 // Pure helpers for the session bridge: naming, addressing, liveness and the
 // text a message is delivered as. Nothing here touches `$`, so tests import it
 // directly.
-import type { BridgeKind, BridgeMessage, BridgePeer } from '../types'
+import type { BridgeKind, BridgeMessage, BridgePeer, CmuxRef } from '../types'
 
 export const KINDS: readonly BridgeKind[] = [
   'message',
@@ -105,7 +105,8 @@ export function splitTarget(args: string): { to: string; text: string } {
 
 export function describePeer(peer: BridgePeer, now: number): string {
   const seconds = Math.max(0, Math.round((now - peer.updatedAt) / 1000))
-  return `${peer.name} (role: ${peer.role}, cwd: ${peer.cwd}, id: ${peer.id.slice(0, 8)}, seen ${seconds}s ago)`
+  const cmux = peer.cmux ? `, cmux workspace: ${peer.cmux.workspace.slice(0, 8)}` : ''
+  return `${peer.name} (role: ${peer.role}, cwd: ${peer.cwd}, id: ${peer.id.slice(0, 8)}${cmux}, seen ${seconds}s ago)`
 }
 
 export function describePeers(
@@ -259,4 +260,82 @@ export function clip(text: string, max: number): string {
 /** Keeps only timestamps inside the window, newest last. */
 export function withinWindow(stamps: readonly number[], now: number): number[] {
   return stamps.filter(stamp => now - stamp < RATE_WINDOW_MS)
+}
+
+// ---- cmux ----------------------------------------------------------------
+//
+// cmux (https://cmux.app) runs each Claude Code session in a terminal surface of a
+// workspace and has a CLI. Inside it, the bridge can show its state in cmux's sidebar,
+// raise a cmux notification for a held message, name the tab after the session, jump to
+// a peer's workspace and start a new session in a workspace of its own.
+
+/** The bridge name and role a spawned session takes, set in its environment. */
+export const ENV_NAME = 'CLAUDE_SESSION_BRIDGE_NAME'
+export const ENV_ROLE = 'CLAUDE_SESSION_BRIDGE_ROLE'
+
+/** The sidebar entry the bridge owns in a cmux workspace. */
+export const CMUX_STATUS_KEY = 'bridge'
+
+/** Where this process runs in cmux, from its environment; nothing outside cmux. */
+export function cmuxFromEnv(get: (key: string) => string | undefined): CmuxRef | undefined {
+  const workspace = (get('CMUX_WORKSPACE_ID') ?? '').trim()
+  if (workspace === '') return undefined
+  const surface = (get('CMUX_SURFACE_ID') ?? get('CMUX_PANEL_ID') ?? '').trim()
+  return surface === '' ? { workspace } : { workspace, surface }
+}
+
+/** `cmux ...` argv lists. Each is run on its own and may fail without harm. */
+export const cmuxArgv = {
+  ping: (): string[] => ['cmux', 'ping'],
+  setStatus: (ref: CmuxRef, text: string): string[] => [
+    'cmux', 'set-status', CMUX_STATUS_KEY, text, '--icon', 'link', '--workspace', ref.workspace,
+  ],
+  clearStatus: (ref: CmuxRef): string[] => ['cmux', 'clear-status', CMUX_STATUS_KEY, '--workspace', ref.workspace],
+  notify: (ref: CmuxRef, title: string, body: string): string[] => [
+    'cmux', 'notify', '--title', title, '--body', body, '--workspace', ref.workspace,
+    ...(ref.surface ? ['--surface', ref.surface] : []),
+  ],
+  renameTab: (ref: CmuxRef, title: string): string[] | undefined =>
+    ref.surface ? ['cmux', 'rename-tab', '--workspace', ref.workspace, '--surface', ref.surface, title] : undefined,
+  focus: (ref: CmuxRef): string[][] => [
+    ['cmux', 'select-workspace', '--workspace', ref.workspace],
+    ['cmux', 'trigger-flash', '--workspace', ref.workspace, ...(ref.surface ? ['--surface', ref.surface] : [])],
+  ],
+  spawn: (cwd: string, command: string): string[] => ['cmux', 'new-workspace', '--cwd', cwd, '--command', command],
+}
+
+/** The title cmux shows on a session's tab. */
+export const tabTitle = (name: string, role: string): string => (role === 'general' ? name : `${name} (${role})`)
+
+export type SpawnOptions = { name: string; role: string; skipPermissions: boolean; command?: string }
+
+/**
+ * The shell command a new cmux workspace runs: Claude Code with the bridge name and role in
+ * its environment, so the session takes them on start and can be addressed at once. Name and
+ * role are already sanitized (letters, digits, `.`, `_`, `-`), so they need no quoting.
+ */
+export function spawnCommand(options: SpawnOptions): string {
+  const flags = options.skipPermissions ? ' --dangerously-skip-permissions' : ''
+  // The `spawnCommand` option, one line: it may carry its own VAR=value prefixes, which the shell
+  // evaluates when the workspace starts (so a key can be read from a file then, not stored here).
+  const command = options.command?.replace(/[\r\n]+/g, ' ').trim() || 'claude'
+  return `${ENV_NAME}=${options.name} ${ENV_ROLE}=${options.role} ${command}${flags}`
+}
+
+/**
+ * Splits `/bridge-spawn <name> [role] [--skip-permissions] [-- message]` into its parts. The
+ * message after `--` is queued for the new session, which reads it as its first turn.
+ */
+export function parseSpawn(args: string): {
+  name: string
+  role: string
+  skipPermissions: boolean
+  message: string
+} {
+  const [head = '', ...tail] = args.split(/\s--(?:\s|$)/)
+  const message = tail.join(' -- ').trim()
+  const words = head.trim().split(/\s+/).filter(Boolean)
+  const skipPermissions = words.includes('--skip-permissions')
+  const [name = '', role = ''] = words.filter(word => word !== '--skip-permissions')
+  return { name, role, skipPermissions, message }
 }

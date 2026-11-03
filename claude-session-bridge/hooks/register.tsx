@@ -1,12 +1,14 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionReceiveOrigin, SessionSendResult, Timer } from 'claude-code'
 
-import type { BridgeKind, BridgeLogEntry, BridgeMessage, BridgePeer } from '../types'
+import type { BridgeKind, BridgeLogEntry, BridgeMessage, BridgePeer, CmuxRef } from '../types'
 import {
   RATE_LIMIT,
   STALE_MS,
   asKind,
   clip,
+  cmuxArgv,
+  cmuxFromEnv,
   defaultName,
   describePeers,
   formatDelivery,
@@ -17,9 +19,12 @@ import {
   isLive,
   newMessageId,
   parseDelivery,
+  parseSpawn,
   resolveTarget,
   sanitizeName,
+  spawnCommand,
   splitTarget,
+  tabTitle,
   withinWindow,
 } from './bridge'
 
@@ -48,6 +53,10 @@ let lastStatus = ''
 let timers: Timer[] = []
 let carried: Carried | undefined
 let rebasing: Promise<BridgePeer> | undefined
+/** Where this session runs in cmux; undefined outside cmux, or with the `cmux` option off. */
+let cmux: CmuxRef | undefined
+/** What a spawned session runs (the `spawnCommand` option); empty means `claude`. */
+let spawnBin = ''
 
 const dirs = {
   sessions: () => `${root}/sessions`,
@@ -63,6 +72,19 @@ async function sh($: $, argv: string[]) {
   } catch {
     return false
   }
+}
+
+/** Runs one cmux CLI call. A failure is logged for debugging and never reaches the model or the person. */
+async function cmuxRun($: $, argv: string[] | undefined) {
+  if (cmux === undefined || argv === undefined) return false
+  const ok = await sh($, argv)
+  if (!ok) $.ui.log(`session-bridge: \`${argv.slice(0, 2).join(' ')}\` failed`, { to: 'debug' })
+  return ok
+}
+
+/** Raises a cmux notification (the workspace is marked unread) next to the in-session toast. */
+function cmuxNotify($: $, body: string) {
+  return cmux === undefined ? undefined : cmuxRun($, cmuxArgv.notify(cmux, 'Session bridge', body))
 }
 
 /**
@@ -99,7 +121,7 @@ function rebase($: $, held: BridgePeer | null): Promise<BridgePeer> {
       peers.some(p => p.name === name && p.id !== id && p.id !== before?.id && isLive(p, now))
     const identity: Identity =
       stored && !isTaken(stored.name) ? stored : (before ?? { name: defaultName(cwd, id), role: 'general' })
-    const self: BridgePeer = { id, name: identity.name, role: identity.role, cwd, updatedAt: now }
+    const self: BridgePeer = { id, name: identity.name, role: identity.role, cwd, updatedAt: now, ...(cmux ? { cmux } : {}) }
 
     if (before !== null && before.id !== id) await sh($, ['rm', '-f', sessionFile(before.id)])
     await update($, meAtom, () => self)
@@ -155,6 +177,7 @@ async function showStatus($: $) {
   if (text !== lastStatus) {
     lastStatus = text
     $.ui.status(text)
+    if (cmux !== undefined) await cmuxRun($, cmuxArgv.setStatus(cmux, text))
   }
 }
 
@@ -208,6 +231,7 @@ async function admitAuto($: $) {
       `Session bridge: ${RATE_LIMIT}+ auto-delivered messages in 5 minutes, switched to manual. /bridge-auto on to resume.`,
       { timeoutMs: 10_000 },
     )
+    void cmuxNotify($, `${RATE_LIMIT}+ auto-delivered messages in 5 minutes, switched to manual (/bridge-auto on to resume).`)
     return false
   }
   autoStamps.push(now)
@@ -255,6 +279,7 @@ async function poll($: $) {
       void $.prompt.submit({ text: formatPrompt(claimed) })
     } else {
       $.ui.toast(`Session bridge: ${claimed.length} new from ${senders}. /bridge-inbox to read.`)
+      void cmuxNotify($, `${claimed.length} new message${claimed.length === 1 ? '' : 's'} from ${senders}. Run /bridge-inbox to read.`)
     }
   } finally {
     isPolling = false
@@ -399,9 +424,63 @@ async function setIdentity($: $, rawName: string | undefined, rawRole: string | 
   await update($, meAtom, () => ({ ...self, name, role }))
   await $.store.set(`identity:${self.id}`, { name, role })
   await sh($, ['mkdir', '-p', dirs.inbox(name), dirs.archive(name)])
+  // The tab carries the name the session plays, so a row of cmux tabs reads planner / builder / auditor.
+  if (cmux !== undefined) await cmuxRun($, cmuxArgv.renameTab(cmux, tabTitle(name, role)))
   await heartbeat($)
   await poll($)
   return { ok: true as const, text: `This session is now "${name}" (role: ${role}).` }
+}
+
+/**
+ * Starts another Claude Code session in a new cmux workspace, named and with its role already
+ * set, and queues a first message for it. The message waits in the inbox of that name, so the
+ * new session reads it as soon as it has started.
+ */
+async function spawn(
+  $: $,
+  input: { name: string; role?: string; cwd?: string; skipPermissions: boolean; message?: string },
+): Promise<{ ok: true; text: string } | { ok: false; reason: string }> {
+  if (cmux === undefined) {
+    return { ok: false, reason: 'Spawning needs this session to run inside cmux (there is no CMUX_WORKSPACE_ID here), or the cmux option is off.' }
+  }
+  const self = await me($)
+  const name = sanitizeName(input.name)
+  if (name === '') return { ok: false, reason: `"${input.name}" is not a usable session name.` }
+  const now = await $.clock.now()
+  const taken = (await readPeers($)).find(p => p.name === name && isLive(p, now))
+  if (taken) return { ok: false, reason: `"${name}" is already used by live session ${taken.id.slice(0, 8)} in ${taken.cwd}.` }
+
+  const role = sanitizeName(input.role ?? '') || 'general'
+  const cwd = input.cwd?.trim() || self.cwd
+  await sh($, ['mkdir', '-p', dirs.inbox(name), dirs.archive(name)])
+  if (!(await cmuxRun($, cmuxArgv.spawn(cwd, spawnCommand({ name, role, skipPermissions: input.skipPermissions, command: spawnBin }))))) {
+    return { ok: false, reason: 'cmux could not open a new workspace (is cmux running, and is the folder there?).' }
+  }
+  const queued = input.message?.trim()
+    ? await send($, name, { kind: 'message', body: input.message })
+    : undefined
+  if (queued && !queued.ok) {
+    return { ok: true, text: `Started "${name}" (role: ${role}) in a new cmux workspace in ${cwd}, but its first message was not queued: ${queued.reason}` }
+  }
+  return {
+    ok: true,
+    text: `Started "${name}" (role: ${role}) in a new cmux workspace in ${cwd}${input.skipPermissions ? ', with permission prompts OFF (--dangerously-skip-permissions)' : ''}.${
+      queued ? ' Its first message is queued and arrives when the session has started.' : ''
+    } It appears in bridge_peers once it is up.`,
+  }
+}
+
+/** Switches cmux to the workspace of another live session that runs in cmux. */
+async function focus($: $, to: string): Promise<{ ok: true; text: string } | { ok: false; reason: string }> {
+  if (cmux === undefined) return { ok: false, reason: 'Focusing needs this session to run inside cmux, with the cmux option on.' }
+  const now = await $.clock.now()
+  const name = sanitizeName(to)
+  const peers = (await readPeers($)).filter(p => isLive(p, now))
+  const peer = peers.find(p => p.name === name) ?? (to.trim().length >= 6 ? peers.find(p => p.id.startsWith(to.trim())) : undefined)
+  if (peer === undefined) return { ok: false, reason: `No live session is named "${to}".` }
+  if (peer.cmux === undefined) return { ok: false, reason: `"${peer.name}" does not run in cmux, so there is no workspace to switch to.` }
+  for (const argv of cmuxArgv.focus(peer.cmux)) await cmuxRun($, argv)
+  return { ok: true, text: `Switched cmux to "${peer.name}".` }
 }
 
 async function describe($: $) {
@@ -422,16 +501,35 @@ export const register: Register = (on, options) => {
     const home = (await $.env.get('HOME')) ?? ''
     root = (await $.env.get('CLAUDE_SESSION_BRIDGE_DIR')) ?? `${home}/.claude/session-bridge`
     autoDefault = options.autoDeliver !== false
+    spawnBin = typeof options.spawnCommand === 'string' ? options.spawnCommand : ''
+
+    cmux = undefined
+    if (options.cmux !== false) {
+      const env: Record<string, string | undefined> = {
+        CMUX_WORKSPACE_ID: await $.env.get('CMUX_WORKSPACE_ID'),
+        CMUX_SURFACE_ID: await $.env.get('CMUX_SURFACE_ID'),
+        CMUX_PANEL_ID: await $.env.get('CMUX_PANEL_ID'),
+      }
+      const ref = cmuxFromEnv(key => env[key])
+      // Inside cmux but its CLI does not answer: leave the cmux features off.
+      if (ref !== undefined && (await sh($, cmuxArgv.ping()))) cmux = ref
+    }
+
+    // A session started by bridge_spawn carries the name and role it should take.
+    const envName = sanitizeName((await $.env.get('CLAUDE_SESSION_BRIDGE_NAME')) ?? '')
+    const envRole = sanitizeName((await $.env.get('CLAUDE_SESSION_BRIDGE_ROLE')) ?? '')
 
     const id = await $.session.id()
     const stored = (await $.store.get(`identity:${id}`)) as Identity | undefined
     const self: BridgePeer = {
       id,
-      name: stored?.name ?? defaultName(e.cwd, id),
-      role: stored?.role ?? 'general',
+      name: stored?.name ?? (envName || defaultName(e.cwd, id)),
+      role: stored?.role ?? (envRole || 'general'),
       cwd: e.cwd,
       updatedAt: await $.clock.now(),
+      ...(cmux ? { cmux } : {}),
     }
+    if (stored === undefined && envName !== '') await $.store.set(`identity:${id}`, { name: self.name, role: self.role })
     // A reload keeps the identity the session already took, and its auto setting.
     const held = await read($, meAtom)
     await update($, meAtom, () => (held !== null && held.id === id ? held : self))
@@ -440,6 +538,10 @@ export const register: Register = (on, options) => {
 
     const name = (await me($)).name
     await sh($, ['mkdir', '-p', dirs.sessions(), dirs.handoffs(), dirs.inbox(name), dirs.archive(name)])
+
+    if (cmux !== undefined && stored === undefined && envName !== '') {
+      await cmuxRun($, cmuxArgv.renameTab(cmux, tabTitle(self.name, self.role)))
+    }
 
     await Promise.all([
       $.tool.register({
@@ -504,6 +606,39 @@ export const register: Register = (on, options) => {
         },
         isDeferred: false,
       }),
+      ...(cmux === undefined
+        ? []
+        : [
+            $.tool.register({
+              name: 'bridge_spawn',
+              description:
+                'Session bridge (cmux): start another Claude Code session in a new cmux workspace, with the given bridge name and role, and optionally queue a first message for it (it reads it as soon as it is up). Use it only when the user asked for a new session. skip_permissions starts it with --dangerously-skip-permissions: set it only when the user explicitly asked for that, never on your own.',
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  name: { type: 'string', description: 'Bridge name for the new session: letters, digits, ".", "_" or "-".' },
+                  role: { type: 'string', description: 'Its role, e.g. build, audit, review. Default general.' },
+                  cwd: { type: 'string', description: 'Folder to start in. Default: this session\'s folder.' },
+                  message: { type: 'string', description: 'First message for the new session. Be specific and self-contained: it cannot see this conversation.' },
+                  skip_permissions: { type: 'boolean', description: 'Start with --dangerously-skip-permissions. Only if the user explicitly asked. Default false.' },
+                },
+                required: ['name'],
+              },
+              isDeferred: false,
+            }),
+            $.tool.register({
+              name: 'bridge_focus',
+              description: 'Session bridge (cmux): switch cmux to the workspace of another live session that runs in cmux, so the user can see it.',
+              inputSchema: {
+                type: 'object',
+                properties: { name: { type: 'string', description: 'Session name, or a session-id prefix, from bridge_peers.' } },
+                required: ['name'],
+              },
+              isDeferred: false,
+            }),
+            $.command.register({ name: 'bridge-spawn', description: 'Session bridge (cmux): start a named session in a new cmux workspace', argumentHint: '<name> [role] [--skip-permissions] [-- first message]' }),
+            $.command.register({ name: 'bridge-focus', description: 'Session bridge (cmux): switch to another session\'s cmux workspace', argumentHint: '<name>' }),
+          ]),
       $.command.register({ name: 'bridge', description: 'Session bridge: show peers and recent messages in a pane' }),
       $.command.register({ name: 'bridge-name', description: 'Session bridge: name this session (and set its role)', argumentHint: '<name> [role]' }),
       $.command.register({ name: 'bridge-send', description: 'Session bridge: send a message to another session', argumentHint: '<name|*> <message>' }),
@@ -514,7 +649,7 @@ export const register: Register = (on, options) => {
 
     await heartbeat($)
     arm($)
-    void poll($)
+    void poll($).catch(error => $.ui.log(`session-bridge poll: ${error}`, { to: 'debug' }))
 
     return started
   })
@@ -525,6 +660,10 @@ export const register: Register = (on, options) => {
       // whose state may start empty: keep what this one held for it.
       carried = { me: await read($, meAtom), log: await read($, logAtom), isAuto: await read($, autoAtom) }
       await sh($, ['rm', '-f', sessionFile(e.sessionId)])
+      if (cmux !== undefined) {
+        lastStatus = ''
+        await cmuxRun($, cmuxArgv.clearStatus(cmux))
+      }
     }
     return next(e)
   })
@@ -554,6 +693,7 @@ export const register: Register = (on, options) => {
     await showStatus($)
     if (isAuto) return next(e)
     $.ui.toast(`Session bridge: new ${message.kind} from ${message.from.name}. /bridge-inbox to read.`)
+    void cmuxNotify($, `New ${message.kind} from ${message.from.name}. Run /bridge-inbox to read.`)
     return { consumed: 'session-bridge: manual delivery is on; held for /bridge-inbox' }
   })
 
@@ -607,6 +747,23 @@ export const register: Register = (on, options) => {
     return set.ok ? { result: set.text } : { deny: set.reason }
   }).catch(TOOL_FAILED)
 
+  on('tool.call', { tool: 'mcp__session-bridge__bridge_spawn' }, async ($, e) => {
+    const a = args(e)
+    const made = await spawn($, {
+      name: str(a.name) ?? '',
+      role: str(a.role),
+      cwd: str(a.cwd),
+      message: str(a.message),
+      skipPermissions: a.skip_permissions === true,
+    })
+    return made.ok ? { result: made.text } : { deny: made.reason }
+  }).catch(TOOL_FAILED)
+
+  on('tool.call', { tool: 'mcp__session-bridge__bridge_focus' }, async ($, e) => {
+    const shown = await focus($, str(args(e).name) ?? '')
+    return shown.ok ? { result: shown.text } : { deny: shown.reason }
+  }).catch(TOOL_FAILED)
+
   // ---- slash commands the person runs ----
 
   on('command.run', { command: 'bridge' }, async $ => {
@@ -619,6 +776,24 @@ export const register: Register = (on, options) => {
     if (!name) return { text: `${await describe($)}\n\nUsage: /bridge-name <name> [role]` }
     const set = await setIdentity($, name, role)
     return { text: set.ok ? set.text : set.reason }
+  })
+
+  on('command.run', { command: 'bridge-spawn' }, async ($, e) => {
+    const parsed = parseSpawn(e.args)
+    if (!parsed.name) return { text: 'Usage: /bridge-spawn <name> [role] [--skip-permissions] [-- first message]' }
+    const made = await spawn($, {
+      name: parsed.name,
+      role: parsed.role,
+      message: parsed.message,
+      skipPermissions: parsed.skipPermissions,
+    })
+    return { text: made.ok ? made.text : made.reason }
+  })
+
+  on('command.run', { command: 'bridge-focus' }, async ($, e) => {
+    if (!e.args.trim()) return { text: 'Usage: /bridge-focus <name>' }
+    const shown = await focus($, e.args.trim())
+    return { text: shown.ok ? shown.text : shown.reason }
   })
 
   on('command.run', { command: 'bridge-send' }, async ($, e) => {
@@ -675,7 +850,7 @@ export const register: Register = (on, options) => {
     await update($, autoAtom, () => isAuto)
     autoStamps = []
     await showStatus($)
-    if (isAuto) void poll($)
+    if (isAuto) void poll($).catch(error => $.ui.log(`session-bridge poll: ${error}`, { to: 'debug' }))
     return {
       text: isAuto
         ? 'Peer messages reach the model as soon as they arrive.'
@@ -709,9 +884,12 @@ export const register: Register = (on, options) => {
         <Text bold>Peers</Text>
         {live.length === 0 && <Text dimColor>No other live sessions.</Text>}
         {live.map(p => (
-          <Text>
-            {clip(`• ${p.name} (${p.role}) ${p.cwd}`, width - 2)}
-          </Text>
+          <Box>
+            <Text>{clip(`• ${p.name} (${p.role}) ${p.cwd}`, width - 12)} </Text>
+            {cmux !== undefined && p.cmux !== undefined && (
+              <Button key={`focus-${p.id}`} label="Focus" onPress={() => void focus($, p.name)} />
+            )}
+          </Box>
         ))}
         <Text> </Text>
         <Text bold>Messages</Text>

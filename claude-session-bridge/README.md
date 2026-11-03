@@ -65,6 +65,41 @@ A typical plan → build → audit loop:
 
 The status line shows `⇄ <name> (<role>) · N peers · M unread`.
 
+## cmux
+
+cmux runs each Claude Code session in its own workspace. When the bridge detects it (`CMUX_WORKSPACE_ID` and `CMUX_SURFACE_ID` are set), it adds:
+
+- **Sidebar status:** the same line the status line shows (`⇄ <name> (<role>) · N peers · M unread`) appears in the cmux sidebar for that workspace, and is cleared when the session ends.
+- **Notifications on held messages:** when a message is held for `/bridge-inbox` (manual mode, or after the loop guard switches to manual), cmux raises a notification and marks the workspace unread, next to the in-session toast.
+- **Tab rename:** naming a session (`/bridge-name`, `bridge_identify`, or the environment variables below) renames its cmux tab to `name (role)`, or just `name` for the default role. A row of tabs then reads planner / builder / auditor.
+- **Focus button:** the `/bridge` pane shows a Focus button for each peer that runs in cmux.
+
+Spawn and focus:
+
+| Command | What it does |
+| --- | --- |
+| `/bridge-spawn <name> [role] [--skip-permissions] [-- first message]` | Opens a new cmux workspace running `claude`, already named and with its role. Anything after ` -- ` is queued as its first message. |
+| `/bridge-focus <name>` | Switches cmux to that session's workspace |
+
+The model can do the same with the `bridge_spawn` and `bridge_focus` tools. Both are only offered inside cmux. `bridge_spawn` takes `name`, and optionally `role`, `cwd`, `message` and `skip_permissions`. It refuses a name a live session already has. Permission prompts stay on unless `--skip-permissions` (or `skip_permissions`) is given, which starts the new session with `--dangerously-skip-permissions`. The model is told to set that only when you ask for it.
+
+A spawned session picks up its identity from two environment variables, which you can also set yourself when starting `claude` by hand:
+
+| Variable | What it sets |
+| --- | --- |
+| `CLAUDE_SESSION_BRIDGE_NAME` | The session's bridge name at startup |
+| `CLAUDE_SESSION_BRIDGE_ROLE` | Its role (default `general`) |
+
+By default a spawned session runs `claude`. To run something else, such as a wrapper that points `claude` at another endpoint, set the `spawnCommand` option in `/config` → `session-bridge.spawnCommand`. It is put after the two variables above and before `--dangerously-skip-permissions` (which still only appears when you ask for it). It can start with `VAR=value` settings, and the shell evaluates them when the new workspace starts, so a secret can be read from a file then instead of being written into the setting:
+
+```
+ANTHROPIC_BASE_URL=https://proxy.example ANTHROPIC_API_KEY="$(cat ~/.config/proxy.key)" claude
+```
+
+Don't paste a key into this option. It is stored in your settings as plain text. A shell function or alias defined only in your zsh startup files may not exist in the new workspace, so prefer the `VAR=value ... claude` form.
+
+Set the `cmux` option to `false` in `/config` → `session-bridge.cmux` to ignore cmux entirely, even inside it. Outside cmux nothing changes and the bridge never calls the `cmux` command.
+
 ## Install
 
 In a Claude Code terminal session:
@@ -73,7 +108,7 @@ In a Claude Code terminal session:
 /plugin install session-bridge --marketplace iddhi-sulakshana/claude-mods
 ```
 
-You can configure it in `/config` → `session-bridge.autoDeliver` (default `true`).
+You can configure it in `/config`: `session-bridge.autoDeliver` (default `true`) and `session-bridge.cmux` (default `true`).
 
 ## Develop
 
