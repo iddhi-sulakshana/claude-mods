@@ -1,6 +1,6 @@
 {
   "name": "session-bridge",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Lets running Claude Code sessions message each other and hand off context, so one session can plan or audit while another builds.",
   "author": {
     "name": "iddhi"
@@ -11,6 +11,12 @@
       "type": "boolean",
       "title": "Auto-deliver peer messages",
       "description": "Pass incoming peer messages to the model as they arrive. Off: hold them, notify, and read them with /bridge-inbox.",
+      "default": true
+    },
+    "cmux": {
+      "type": "boolean",
+      "title": "Use cmux features",
+      "description": "Inside cmux: show the bridge in the sidebar, raise a cmux notification for a held message, name the tab after the session, and allow bridge_spawn and bridge_focus. Off: ignore cmux.",
       "default": true
     }
   }
