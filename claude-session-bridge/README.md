@@ -90,6 +90,14 @@ A spawned session picks up its identity from two environment variables, which yo
 | `CLAUDE_SESSION_BRIDGE_NAME` | The session's bridge name at startup |
 | `CLAUDE_SESSION_BRIDGE_ROLE` | Its role (default `general`) |
 
+By default a spawned session runs `claude`. To run something else, such as a wrapper that points `claude` at another endpoint, set the `spawnCommand` option in `/config` → `session-bridge.spawnCommand`. It is put after the two variables above and before `--dangerously-skip-permissions` (which still only appears when you ask for it). It can start with `VAR=value` settings, and the shell evaluates them when the new workspace starts, so a secret can be read from a file then instead of being written into the setting:
+
+```
+ANTHROPIC_BASE_URL=https://proxy.example ANTHROPIC_API_KEY="$(cat ~/.config/proxy.key)" claude
+```
+
+Don't paste a key into this option. It is stored in your settings as plain text. A shell function or alias defined only in your zsh startup files may not exist in the new workspace, so prefer the `VAR=value ... claude` form.
+
 Set the `cmux` option to `false` in `/config` → `session-bridge.cmux` to ignore cmux entirely, even inside it. Outside cmux nothing changes and the bridge never calls the `cmux` command.
 
 ## Install

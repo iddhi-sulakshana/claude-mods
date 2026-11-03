@@ -307,7 +307,7 @@ export const cmuxArgv = {
 /** The title cmux shows on a session's tab. */
 export const tabTitle = (name: string, role: string): string => (role === 'general' ? name : `${name} (${role})`)
 
-export type SpawnOptions = { name: string; role: string; skipPermissions: boolean }
+export type SpawnOptions = { name: string; role: string; skipPermissions: boolean; command?: string }
 
 /**
  * The shell command a new cmux workspace runs: Claude Code with the bridge name and role in
@@ -316,7 +316,10 @@ export type SpawnOptions = { name: string; role: string; skipPermissions: boolea
  */
 export function spawnCommand(options: SpawnOptions): string {
   const flags = options.skipPermissions ? ' --dangerously-skip-permissions' : ''
-  return `${ENV_NAME}=${options.name} ${ENV_ROLE}=${options.role} claude${flags}`
+  // The `spawnCommand` option, one line: it may carry its own VAR=value prefixes, which the shell
+  // evaluates when the workspace starts (so a key can be read from a file then, not stored here).
+  const command = options.command?.replace(/[\r\n]+/g, ' ').trim() || 'claude'
+  return `${ENV_NAME}=${options.name} ${ENV_ROLE}=${options.role} ${command}${flags}`
 }
 
 /**

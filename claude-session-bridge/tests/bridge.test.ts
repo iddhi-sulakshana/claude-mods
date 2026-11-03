@@ -437,6 +437,17 @@ describe('cmux helpers', () => {
     expect(spawnCommand({ name: 'builder', role: 'build', skipPermissions: true })).toContain('--dangerously-skip-permissions')
   })
 
+  test('the spawned command is configurable and may read a key file when the shell runs it', () => {
+    const command = 'ANTHROPIC_BASE_URL=https://example.test ANTHROPIC_API_KEY="$(cat ~/.config/some.key)" claude'
+    const text = spawnCommand({ name: 'builder', role: 'build', skipPermissions: true, command })
+    expect(text).toBe(
+      `CLAUDE_SESSION_BRIDGE_NAME=builder CLAUDE_SESSION_BRIDGE_ROLE=build ${command} --dangerously-skip-permissions`,
+    )
+    expect(spawnCommand({ name: 'b', role: 'r', skipPermissions: false, command: '  ' })).toContain(' claude')
+    expect(spawnCommand({ name: 'b', role: 'r', skipPermissions: false, command: 'one\ntwo' })).toContain('one two')
+    expect(spawnCommand({ name: 'b', role: 'r', skipPermissions: false, command: 'tclaude' })).not.toContain('--dangerously')
+  })
+
   test('/bridge-spawn arguments split into name, role, flag and first message', () => {
     expect(parseSpawn('builder build --skip-permissions -- do the thing -- twice')).toEqual({
       name: 'builder',
@@ -538,6 +549,16 @@ describe('the bridge in cmux', () => {
     ])
     expect(inboxFiles(files, 'builder').length).toBe(1)
     expect(String(result.result)).not.toContain('permission prompts OFF')
+  })
+
+  test('bridge_spawn runs the configured spawnCommand option', { options: { spawnCommand: 'tclaude' } }, async ($, on) => {
+    mock.clock(on, { now: NOW })
+    mock.store(on)
+    const { cmuxCalls } = world(on, CMUX_ENV)
+    await start($)
+    await $.tool.call({ tool: 'mcp__session-bridge__bridge_spawn', name: 'builder' } as never)
+    const made = cmuxCalls.find(c => c[1] === 'new-workspace')
+    expect(made?.at(-1)).toBe('CLAUDE_SESSION_BRIDGE_NAME=builder CLAUDE_SESSION_BRIDGE_ROLE=general tclaude')
   })
 
   test('bridge_spawn turns permission prompts off only when asked', async ($, on) => {

@@ -18,6 +18,12 @@
       "title": "Use cmux features",
       "description": "Inside cmux: show the bridge in the sidebar, raise a cmux notification for a held message, name the tab after the session, and allow bridge_spawn and bridge_focus. Off: ignore cmux.",
       "default": true
+    },
+    "spawnCommand": {
+      "type": "string",
+      "title": "Command for spawned sessions",
+      "description": "What bridge_spawn and /bridge-spawn run in the new cmux workspace. Default: claude. It may start with VAR=value settings; the shell evaluates them when the workspace starts. Do not paste secrets here: read them from a file instead, e.g. ANTHROPIC_API_KEY=\"$(cat ~/.config/some.key)\" claude",
+      "default": "claude"
     }
   }
 }

@@ -55,6 +55,8 @@ let carried: Carried | undefined
 let rebasing: Promise<BridgePeer> | undefined
 /** Where this session runs in cmux; undefined outside cmux, or with the `cmux` option off. */
 let cmux: CmuxRef | undefined
+/** What a spawned session runs (the `spawnCommand` option); empty means `claude`. */
+let spawnBin = ''
 
 const dirs = {
   sessions: () => `${root}/sessions`,
@@ -451,7 +453,7 @@ async function spawn(
   const role = sanitizeName(input.role ?? '') || 'general'
   const cwd = input.cwd?.trim() || self.cwd
   await sh($, ['mkdir', '-p', dirs.inbox(name), dirs.archive(name)])
-  if (!(await cmuxRun($, cmuxArgv.spawn(cwd, spawnCommand({ name, role, skipPermissions: input.skipPermissions }))))) {
+  if (!(await cmuxRun($, cmuxArgv.spawn(cwd, spawnCommand({ name, role, skipPermissions: input.skipPermissions, command: spawnBin }))))) {
     return { ok: false, reason: 'cmux could not open a new workspace (is cmux running, and is the folder there?).' }
   }
   const queued = input.message?.trim()
@@ -499,6 +501,7 @@ export const register: Register = (on, options) => {
     const home = (await $.env.get('HOME')) ?? ''
     root = (await $.env.get('CLAUDE_SESSION_BRIDGE_DIR')) ?? `${home}/.claude/session-bridge`
     autoDefault = options.autoDeliver !== false
+    spawnBin = typeof options.spawnCommand === 'string' ? options.spawnCommand : ''
 
     cmux = undefined
     if (options.cmux !== false) {
