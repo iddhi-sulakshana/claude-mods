@@ -1,6 +1,6 @@
 {
   "name": "session-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Lets running Claude Code sessions message each other and hand off context, so one session can plan or audit while another builds.",
   "author": {
     "name": "iddhi"
@@ -10,7 +10,7 @@
     "autoDeliver": {
       "type": "boolean",
       "title": "Auto-deliver peer messages",
-      "description": "Submit incoming peer messages to the model as a new turn once the session is idle. Off: only notify, and read them with /bridge-inbox.",
+      "description": "Pass incoming peer messages to the model as they arrive. Off: hold them, notify, and read them with /bridge-inbox.",
       "default": true
     }
   }
