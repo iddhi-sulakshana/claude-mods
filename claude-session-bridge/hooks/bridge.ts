@@ -1,7 +1,7 @@
 // Pure helpers for the session bridge: naming, addressing, liveness and the
 // text a message is delivered as. Nothing here touches `$`, so tests import it
 // directly.
-import type { BridgeKind, BridgeMessage, BridgePeer, CmuxRef } from '../types'
+import type { BridgeEvent, BridgeKind, BridgeMessage, BridgePeer, CmuxRef } from '../types'
 
 export const KINDS: readonly BridgeKind[] = [
   'message',
@@ -255,6 +255,49 @@ export function handoffBody(doc: string, path: string): string {
 
 export function clip(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)}… [${text.length - max} more characters]`
+}
+
+// ---- events for agentboard ------------------------------------------------
+//
+// One small file per sent message, `events/<message id>.json`, so a board app can draw who
+// talked to whom. It holds names and a short preview, never the whole body.
+
+/** Event files older than this are removed by any session's heartbeat. */
+export const EVENT_TTL_MS = 10 * 60_000
+export const PREVIEW_CHARS = 80
+
+/** The start of a message body on one line, without control characters, at most PREVIEW_CHARS long. */
+export function preview(body: string): string {
+  const flat = body
+    .replace(/\s+/g, ' ')
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .trim()
+  return flat.length <= PREVIEW_CHARS ? flat : `${flat.slice(0, PREVIEW_CHARS - 1)}…`
+}
+
+export function eventRecord(message: BridgeMessage, names: readonly string[]): BridgeEvent {
+  return {
+    v: 1,
+    id: message.id,
+    at: message.createdAt,
+    kind: message.kind,
+    from: { id: message.from.id, name: message.from.name },
+    to: [...names],
+    preview: preview(message.body),
+  }
+}
+
+/** When an event file was written, from its name (`<ms>-<tail>.json` or `.<ms>-<tail>.tmp`). */
+export function eventFileTime(fileName: string): number | undefined {
+  const match = /^(?:(\d+)-[0-9a-z]+\.json|\.(\d+)-[0-9a-z]+\.tmp)$/.exec(fileName)
+  const digits = match?.[1] ?? match?.[2]
+  return digits === undefined ? undefined : Number(digits)
+}
+
+/** True for an event file old enough to delete; never for a file whose name it does not understand. */
+export function isExpiredEvent(fileName: string, now: number): boolean {
+  const at = eventFileTime(fileName)
+  return at !== undefined && now - at > EVENT_TTL_MS
 }
 
 /** Keeps only timestamps inside the window, newest last. */

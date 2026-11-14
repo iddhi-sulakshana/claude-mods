@@ -34,6 +34,19 @@ export type BridgeMessage = {
   createdAt: number
 }
 
+/** One sent message, as written to `events/<id>.json` for a board app to draw. */
+export type BridgeEvent = {
+  v: 1
+  id: string
+  /** Unix milliseconds. */
+  at: number
+  kind: BridgeKind
+  from: { id: string; name: string }
+  /** The recipient names: the live sessions it went to, or the one name it is queued for. */
+  to: string[]
+  preview: string
+}
+
 export type BridgeLogEntry = {
   direction: 'in' | 'out'
   message: BridgeMessage

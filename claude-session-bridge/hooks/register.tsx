@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionReceiveOrigin, SessionSendResult, Timer } from 'claude-code'
 
-import type { BridgeKind, BridgeLogEntry, BridgeMessage, BridgePeer, CmuxRef } from '../types'
+import type { BridgeEvent, BridgeKind, BridgeLogEntry, BridgeMessage, BridgePeer, CmuxRef } from '../types'
 import {
   RATE_LIMIT,
   STALE_MS,
@@ -12,10 +12,12 @@ import {
   defaultName,
   describePeers,
   formatDelivery,
+  eventRecord,
   formatHandoff,
   formatPeerText,
   formatPrompt,
   handoffBody,
+  isExpiredEvent,
   isLive,
   newMessageId,
   parseDelivery,
@@ -63,6 +65,7 @@ const dirs = {
   inbox: (name: string) => `${root}/inbox/${name}`,
   archive: (name: string) => `${root}/archive/${name}`,
   handoffs: () => `${root}/handoffs`,
+  events: () => `${root}/events`,
 }
 const sessionFile = (id: string) => `${dirs.sessions()}/${id}.json`
 
@@ -196,6 +199,10 @@ async function heartbeat($: $) {
     }
   }
   await update($, peersAtom, () => peers.filter(p => now - p.updatedAt <= 10 * STALE_MS))
+
+  const events = await $.fs.list(dirs.events()).catch(() => [])
+  const expired = events.filter(entry => entry.kind === 'file' && isExpiredEvent(entry.name, now))
+  if (expired.length > 0) await sh($, ['rm', '-f', ...expired.map(entry => `${dirs.events()}/${entry.name}`)])
   await showStatus($)
 }
 
@@ -287,6 +294,13 @@ async function poll($: $) {
   }
 }
 
+/** Records a sent message for board apps (agentboard): temp file first, then a rename, like the inbox. */
+async function writeEvent($: $, event: BridgeEvent) {
+  const temp = `${dirs.events()}/.${event.id}.tmp`
+  await $.fs.write(temp, JSON.stringify(event))
+  return sh($, ['mv', temp, `${dirs.events()}/${event.id}.json`])
+}
+
 /** Writes a message into an inbox: temp file first, then a rename, so a reader never sees half of it. */
 async function enqueue($: $, message: BridgeMessage) {
   const inbox = dirs.inbox(message.to)
@@ -349,6 +363,8 @@ async function send(
     }
   }
   await appendLog($, [{ direction: 'out', message, isDelivered: true }])
+  // Only a board app reads events; a failure here never fails the send.
+  await writeEvent($, eventRecord(message, names)).catch(() => undefined)
 
   const text =
     resolved.kind === 'offline'
@@ -537,7 +553,7 @@ export const register: Register = (on, options) => {
     if (version === 0) await update($, autoAtom, () => autoDefault)
 
     const name = (await me($)).name
-    await sh($, ['mkdir', '-p', dirs.sessions(), dirs.handoffs(), dirs.inbox(name), dirs.archive(name)])
+    await sh($, ['mkdir', '-p', dirs.sessions(), dirs.handoffs(), dirs.events(), dirs.inbox(name), dirs.archive(name)])
 
     if (cmux !== undefined && stored === undefined && envName !== '') {
       await cmuxRun($, cmuxArgv.renameTab(cmux, tabTitle(self.name, self.role)))

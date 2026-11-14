@@ -6,10 +6,14 @@ import {
   cmuxArgv,
   cmuxFromEnv,
   defaultName,
+  EVENT_TTL_MS,
+  eventRecord,
   formatPeerText,
   formatPrompt,
   parseDelivery,
   parseSpawn,
+  isExpiredEvent,
+  preview,
   resolveTarget,
   sanitizeName,
   spawnCommand,
@@ -604,5 +608,65 @@ describe('the bridge in cmux', () => {
     expect(cmuxCalls.find(c => c[1] === 'select-workspace')).toEqual(['cmux', 'select-workspace', '--workspace', 'WS-9999'])
     const no = await $.tool.call({ tool: 'mcp__session-bridge__bridge_focus', name: 'plain' } as never)
     expect(no.deny).toContain('does not run in cmux')
+  })
+})
+
+describe('agentboard event files', () => {
+  test('a send leaves one event file with names and a preview', async ($, on) => {
+    mock.clock(on, { now: NOW })
+    mock.store(on)
+    const { files } = world(on)
+    files.set(`${ROOT}/sessions/bbbb2222-0000.json`, JSON.stringify(peer({})))
+    await $.session.start({ cwd: '/work/app', surface: 'terminal', isInteractive: true })
+    await $.tool.call({ tool: 'mcp__session-bridge__bridge_send', to: 'planner', body: 'Step 2 is done.', kind: 'status' } as never)
+
+    const names = [...files.keys()].filter(p => p.startsWith(`${ROOT}/events/`))
+    expect(names.length).toBe(1)
+    expect(names[0]?.endsWith('.json')).toBe(true)
+    const event = JSON.parse(files.get(names[0] ?? '') ?? '{}')
+    expect(event).toEqual({ v: 1, id: event.id, at: NOW, kind: 'status', from: { id: ME, name: 'app-aaaa' },
+      to: ['planner'], preview: 'Step 2 is done.' })
+  })
+
+  test('the heartbeat removes old event files and keeps the rest', async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    mock.store(on)
+    const { files } = world(on)
+    const old = `${ROOT}/events/${NOW - EVENT_TTL_MS - 1}-aaaaaa.json`
+    const fresh = `${ROOT}/events/${NOW}-bbbbbb.json`
+    const foreign = `${ROOT}/events/notes.json`
+    for (const path of [old, fresh, foreign]) files.set(path, '{}')
+    await $.session.start({ cwd: '/work/app', surface: 'terminal', isInteractive: true })
+    await clock.advance(10_000)
+    expect([files.has(old), files.has(fresh), files.has(foreign)]).toEqual([false, true, true])
+  })
+})
+
+describe('agentboard events', () => {
+  const VECTORS: [string, string][] = [
+    ['Lead', 'lead'], ['Lead 2', 'lead-2'], ["O'Neil", 'o-neil'], ['  Ben  ', 'ben'], ['Ünal', 'nal'], ['日本', ''],
+    ['.hidden.', 'hidden'], ['KYC_new.v2', 'kyc_new.v2'], ['a'.repeat(50), 'a'.repeat(40)], ['a'.repeat(39) + ' b', 'a'.repeat(39) + '-'],
+  ]
+  test('sanitizeName agrees with agentboard', () => {
+    for (const [input, want] of VECTORS) expect(sanitizeName(input)).toBe(want)
+  })
+  test('preview flattens, strips control characters and cuts to 80', () => {
+    expect(preview('hello\n\tworld')).toBe('hello world')
+    expect(preview('a\u0007b')).toBe('ab')
+    const long = preview('x'.repeat(200))
+    expect(long.length).toBe(80)
+    expect(long.endsWith('…')).toBe(true)
+  })
+  test('eventRecord keeps what agentboard draws, not the body', () => {
+    const msg: BridgeMessage = { id: `${NOW}-abc123`, kind: 'question', from: { id: ME, name: 'lead', role: 'lead', cwd: '/w' },
+      to: 'ben,cy', body: 'Which DB?', createdAt: NOW }
+    expect(eventRecord(msg, ['ben', 'cy'])).toEqual({ v: 1, id: `${NOW}-abc123`, at: NOW, kind: 'question',
+      from: { id: ME, name: 'lead' }, to: ['ben', 'cy'], preview: 'Which DB?' })
+  })
+  test('old event files expire; files it does not understand never do', () => {
+    expect(isExpiredEvent(`${NOW - EVENT_TTL_MS - 1}-aaaaaa.json`, NOW)).toBe(true)
+    expect(isExpiredEvent(`.${NOW - EVENT_TTL_MS - 1}-aaaaaa.tmp`, NOW)).toBe(true)
+    expect(isExpiredEvent(`${NOW}-aaaaaa.json`, NOW)).toBe(false)
+    expect(isExpiredEvent('notes.json', NOW)).toBe(false)
   })
 })

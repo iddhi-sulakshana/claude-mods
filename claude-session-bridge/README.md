@@ -12,6 +12,7 @@ Sessions find each other through a folder on disk, `~/.claude/session-bridge/` (
 | `inbox/<name>/<msg-id>.json` | Messages waiting for a name that no running session has yet, or that couldn't be delivered directly. Each session checks its inbox every 2 s. |
 | `archive/<name>/` | Inbox messages after delivery. A message is claimed by moving it here, so only one session can take it. |
 | `handoffs/<msg-id>.md` | Handoff documents. |
+| `events/<msg-id>.json` | One record per sent message (sender, recipients, kind, an 80-character preview) for board apps such as agentboard. Removed after 10 minutes. |
 
 Messages are addressed **by name**. How one travels depends on whether a session has that name right now:
 
