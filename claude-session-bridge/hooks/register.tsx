@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionReceiveOrigin, SessionSendResult, Timer } from 'claude-code'
 
-import type { BridgeEvent, BridgeKind, BridgeLogEntry, BridgeMessage, BridgePeer, CmuxRef } from '../types'
+import type { BridgeEvent, BridgeKind, BridgeLogEntry, BridgeMessage, BridgePeer, CmuxRef, ZendrRef } from '../types'
 import {
   RATE_LIMIT,
   STALE_MS,
@@ -26,10 +26,13 @@ import {
   parseSpawn,
   resolveTarget,
   sanitizeName,
+  spawnArgv,
   spawnCommand,
   splitTarget,
   tabTitle,
   withinWindow,
+  zendrArgv,
+  zendrFromEnv,
 } from './bridge'
 
 type $ = EngineInterface
@@ -59,9 +62,13 @@ let carried: Carried | undefined
 let rebasing: Promise<BridgePeer> | undefined
 /** Where this session runs in cmux; undefined outside cmux, or with the `cmux` option off. */
 let cmux: CmuxRef | undefined
+/** Where this session runs in Zendr; undefined outside it (or inside cmux), or with the `zendr` option off. */
+let zendr: ZendrRef | undefined
 /** What a spawned session runs (the `spawnCommand` option); empty means `claude`. */
 let spawnBin = ''
 let isWindows = false
+/** The login shell a Zendr space runs a spawned session in, off Windows. */
+let loginShell = ''
 /** mkdir, mv and rm, or cmd's own on Windows. */
 let files = fileArgv(false)
 
@@ -90,10 +97,23 @@ async function cmuxRun($: $, argv: string[] | undefined) {
   return ok
 }
 
-/** Raises a cmux notification (the workspace is marked unread) next to the in-session toast. */
-function cmuxNotify($: $, body: string) {
-  return cmux === undefined ? undefined : cmuxRun($, cmuxArgv.notify(cmux, 'Session bridge', body))
+/** Runs one `hc` call for Zendr, failing quietly like cmuxRun. */
+async function zendrRun($: $, argv: string[]) {
+  if (zendr === undefined) return false
+  const ok = await sh($, argv)
+  if (!ok) $.ui.log(`session-bridge: \`${argv.slice(0, 2).join(' ')}\` failed`, { to: 'debug' })
+  return ok
 }
+
+/** Raises a cmux or Zendr notification (the workspace is marked unread) next to the in-session toast. */
+async function hostNotify($: $, body: string) {
+  if (cmux !== undefined) await cmuxRun($, cmuxArgv.notify(cmux, 'Session bridge', body))
+  if (zendr !== undefined) await zendrRun($, zendrArgv.notify(zendr, Math.random().toString(36).slice(2, 10), 'Session bridge', body))
+}
+
+/** Where a session runs that the bridge can show and start sessions in: cmux, else Zendr. */
+const host = () => (cmux !== undefined ? 'cmux' : zendr !== undefined ? 'Zendr' : undefined)
+const hostRefs = () => ({ ...(cmux ? { cmux } : {}), ...(zendr ? { zendr } : {}) })
 
 /**
  * This session's identity. A /resume (and a /clear) moves the process to
@@ -129,7 +149,7 @@ function rebase($: $, held: BridgePeer | null): Promise<BridgePeer> {
       peers.some(p => p.name === name && p.id !== id && p.id !== before?.id && isLive(p, now))
     const identity: Identity =
       stored && !isTaken(stored.name) ? stored : (before ?? { name: defaultName(cwd, id), role: 'general' })
-    const self: BridgePeer = { id, name: identity.name, role: identity.role, cwd, updatedAt: now, ...(cmux ? { cmux } : {}) }
+    const self: BridgePeer = { id, name: identity.name, role: identity.role, cwd, updatedAt: now, ...hostRefs() }
 
     if (before !== null && before.id !== id) await sh($, files.remove([sessionFile(before.id)]))
     await update($, meAtom, () => self)
@@ -186,6 +206,7 @@ async function showStatus($: $) {
     lastStatus = text
     $.ui.status(text)
     if (cmux !== undefined) await cmuxRun($, cmuxArgv.setStatus(cmux, text))
+    if (zendr !== undefined) await zendrRun($, zendrArgv.setStatus(zendr, text))
   }
 }
 
@@ -243,7 +264,7 @@ async function admitAuto($: $) {
       `Session bridge: ${RATE_LIMIT}+ auto-delivered messages in 5 minutes, switched to manual. /bridge-auto on to resume.`,
       { timeoutMs: 10_000 },
     )
-    void cmuxNotify($, `${RATE_LIMIT}+ auto-delivered messages in 5 minutes, switched to manual (/bridge-auto on to resume).`)
+    void hostNotify($, `${RATE_LIMIT}+ auto-delivered messages in 5 minutes, switched to manual (/bridge-auto on to resume).`)
     return false
   }
   autoStamps.push(now)
@@ -291,7 +312,7 @@ async function poll($: $) {
       void $.prompt.submit({ text: formatPrompt(claimed) })
     } else {
       $.ui.toast(`Session bridge: ${claimed.length} new from ${senders}. /bridge-inbox to read.`)
-      void cmuxNotify($, `${claimed.length} new message${claimed.length === 1 ? '' : 's'} from ${senders}. Run /bridge-inbox to read.`)
+      void hostNotify($, `${claimed.length} new message${claimed.length === 1 ? '' : 's'} from ${senders}. Run /bridge-inbox to read.`)
     }
   } finally {
     isPolling = false
@@ -445,15 +466,16 @@ async function setIdentity($: $, rawName: string | undefined, rawRole: string | 
   await update($, meAtom, () => ({ ...self, name, role }))
   await $.store.set(`identity:${self.id}`, { name, role })
   await sh($, files.mkdir([dirs.inbox(name), dirs.archive(name)]))
-  // The tab carries the name the session plays, so a row of cmux tabs reads planner / builder / auditor.
+  // The tab carries the name the session plays, so a row of tabs reads planner / builder / auditor.
   if (cmux !== undefined) await cmuxRun($, cmuxArgv.renameTab(cmux, tabTitle(name, role)))
+  if (zendr !== undefined) await zendrRun($, zendrArgv.renameTab(zendr, tabTitle(name, role)))
   await heartbeat($)
   await poll($)
   return { ok: true as const, text: `This session is now "${name}" (role: ${role}).` }
 }
 
 /**
- * Starts another Claude Code session in a new cmux workspace, named and with its role already
+ * Starts another Claude Code session in a new cmux workspace (or Zendr space), named and with its role already
  * set, and queues a first message for it. The message waits in the inbox of that name, so the
  * new session reads it as soon as it has started.
  */
@@ -461,8 +483,9 @@ async function spawn(
   $: $,
   input: { name: string; role?: string; cwd?: string; skipPermissions: boolean; message?: string },
 ): Promise<{ ok: true; text: string } | { ok: false; reason: string }> {
-  if (cmux === undefined) {
-    return { ok: false, reason: 'Spawning needs this session to run inside cmux (there is no CMUX_WORKSPACE_ID here), or the cmux option is off.' }
+  const where = cmux !== undefined ? 'a new cmux workspace' : 'a new Zendr space'
+  if (host() === undefined) {
+    return { ok: false, reason: 'Spawning needs this session to run inside cmux or Zendr (there is no CMUX_WORKSPACE_ID or HC_TERMINAL_ID here), or their options are off.' }
   }
   const self = await me($)
   const name = sanitizeName(input.name)
@@ -474,34 +497,47 @@ async function spawn(
   const role = sanitizeName(input.role ?? '') || 'general'
   const cwd = input.cwd?.trim() || self.cwd
   await sh($, files.mkdir([dirs.inbox(name), dirs.archive(name)]))
-  if (!(await cmuxRun($, cmuxArgv.spawn(cwd, spawnCommand({ name, role, skipPermissions: input.skipPermissions, command: spawnBin }))))) {
-    return { ok: false, reason: 'cmux could not open a new workspace (is cmux running, and is the folder there?).' }
+  const options = { name, role, skipPermissions: input.skipPermissions, command: spawnBin }
+  if (cmux !== undefined) {
+    if (!(await cmuxRun($, cmuxArgv.spawn(cwd, spawnCommand(options))))) {
+      return { ok: false, reason: 'cmux could not open a new workspace (is cmux running, and is the folder there?).' }
+    }
+  } else if (zendr !== undefined) {
+    const argv = spawnArgv({ ...options, isWindows, shell: loginShell })
+    if (!(await zendrRun($, zendrArgv.spawn(zendr, { id: newMessageId(now, Math.random()), name, cwd, argv })))) {
+      return { ok: false, reason: 'Zendr could not be asked for a new space (is its core, hc, running?).' }
+    }
   }
   const queued = input.message?.trim()
     ? await send($, name, { kind: 'message', body: input.message })
     : undefined
   if (queued && !queued.ok) {
-    return { ok: true, text: `Started "${name}" (role: ${role}) in a new cmux workspace in ${cwd}, but its first message was not queued: ${queued.reason}` }
+    return { ok: true, text: `Started "${name}" (role: ${role}) in ${where} in ${cwd}, but its first message was not queued: ${queued.reason}` }
   }
   return {
     ok: true,
-    text: `Started "${name}" (role: ${role}) in a new cmux workspace in ${cwd}${input.skipPermissions ? ', with permission prompts OFF (--dangerously-skip-permissions)' : ''}.${
+    text: `Started "${name}" (role: ${role}) in ${where} in ${cwd}${input.skipPermissions ? ', with permission prompts OFF (--dangerously-skip-permissions)' : ''}.${
       queued ? ' Its first message is queued and arrives when the session has started.' : ''
     } It appears in bridge_peers once it is up.`,
   }
 }
 
-/** Switches cmux to the workspace of another live session that runs in cmux. */
+/** Switches cmux (or Zendr) to the workspace of another live session that runs in it. */
 async function focus($: $, to: string): Promise<{ ok: true; text: string } | { ok: false; reason: string }> {
-  if (cmux === undefined) return { ok: false, reason: 'Focusing needs this session to run inside cmux, with the cmux option on.' }
+  if (host() === undefined) return { ok: false, reason: 'Focusing needs this session to run inside cmux or Zendr, with that option on.' }
   const now = await $.clock.now()
   const name = sanitizeName(to)
   const peers = (await readPeers($)).filter(p => isLive(p, now))
   const peer = peers.find(p => p.name === name) ?? (to.trim().length >= 6 ? peers.find(p => p.id.startsWith(to.trim())) : undefined)
   if (peer === undefined) return { ok: false, reason: `No live session is named "${to}".` }
-  if (peer.cmux === undefined) return { ok: false, reason: `"${peer.name}" does not run in cmux, so there is no workspace to switch to.` }
-  for (const argv of cmuxArgv.focus(peer.cmux)) await cmuxRun($, argv)
-  return { ok: true, text: `Switched cmux to "${peer.name}".` }
+  if (cmux !== undefined) {
+    if (peer.cmux === undefined) return { ok: false, reason: `"${peer.name}" does not run in cmux, so there is no workspace to switch to.` }
+    for (const argv of cmuxArgv.focus(peer.cmux)) await cmuxRun($, argv)
+    return { ok: true, text: `Switched cmux to "${peer.name}".` }
+  }
+  if (zendr === undefined || peer.zendr === undefined) return { ok: false, reason: `"${peer.name}" does not run in Zendr, so there is no terminal to show.` }
+  await zendrRun($, zendrArgv.focus(peer.zendr, newMessageId(now, Math.random())))
+  return { ok: true, text: `Switched Zendr to "${peer.name}".` }
 }
 
 async function describe($: $) {
@@ -523,9 +559,11 @@ export const register: Register = (on, options) => {
     root = (await $.env.get('CLAUDE_SESSION_BRIDGE_DIR')) ?? defaultRoot(key => home[key])
     isWindows = (await $.env.get('OS')) === 'Windows_NT'
     files = fileArgv(isWindows)
+    loginShell = (await $.env.get('SHELL')) ?? ''
     autoDefault = options.autoDeliver !== false
     spawnBin = typeof options.spawnCommand === 'string' ? options.spawnCommand : ''
 
+    const terminalId = await $.env.get('HC_TERMINAL_ID')
     cmux = undefined
     if (options.cmux !== false) {
       const env: Record<string, string | undefined> = {
@@ -536,6 +574,12 @@ export const register: Register = (on, options) => {
       const ref = cmuxFromEnv(key => env[key])
       // Inside cmux but its CLI does not answer: leave the cmux features off.
       if (ref !== undefined && (await sh($, cmuxArgv.ping()))) cmux = ref
+    }
+    zendr = undefined
+    if (cmux === undefined && options.zendr !== false) {
+      const ref = zendrFromEnv(key => (key === 'HC_TERMINAL_ID' ? terminalId : undefined))
+      // In a Zendr (Herdr) terminal whose core does not answer: leave the Zendr features off.
+      if (ref !== undefined && (await sh($, zendrArgv.ping(ref)))) zendr = ref
     }
 
     // A session started by bridge_spawn carries the name and role it should take.
@@ -550,7 +594,7 @@ export const register: Register = (on, options) => {
       role: stored?.role ?? (envRole || 'general'),
       cwd: e.cwd,
       updatedAt: await $.clock.now(),
-      ...(cmux ? { cmux } : {}),
+      ...hostRefs(),
     }
     if (stored === undefined && envName !== '') await $.store.set(`identity:${id}`, { name: self.name, role: self.role })
     // A reload keeps the identity the session already took, and its auto setting.
@@ -564,6 +608,9 @@ export const register: Register = (on, options) => {
 
     if (cmux !== undefined && stored === undefined && envName !== '') {
       await cmuxRun($, cmuxArgv.renameTab(cmux, tabTitle(self.name, self.role)))
+    }
+    if (zendr !== undefined && stored === undefined && envName !== '') {
+      await zendrRun($, zendrArgv.renameTab(zendr, tabTitle(self.name, self.role)))
     }
 
     await Promise.all([
@@ -629,13 +676,13 @@ export const register: Register = (on, options) => {
         },
         isDeferred: false,
       }),
-      ...(cmux === undefined
+      ...(host() === undefined
         ? []
         : [
             $.tool.register({
               name: 'bridge_spawn',
               description:
-                'Session bridge (cmux): start another Claude Code session in a new cmux workspace, with the given bridge name and role, and optionally queue a first message for it (it reads it as soon as it is up). Use it only when the user asked for a new session. skip_permissions starts it with --dangerously-skip-permissions: set it only when the user explicitly asked for that, never on your own.',
+                `Session bridge (${host()}): start another Claude Code session in ${cmux !== undefined ? 'a new cmux workspace' : 'a new Zendr space'}, with the given bridge name and role, and optionally queue a first message for it (it reads it as soon as it is up). Use it only when the user asked for a new session. skip_permissions starts it with --dangerously-skip-permissions: set it only when the user explicitly asked for that, never on your own.`,
               inputSchema: {
                 type: 'object',
                 properties: {
@@ -651,7 +698,7 @@ export const register: Register = (on, options) => {
             }),
             $.tool.register({
               name: 'bridge_focus',
-              description: 'Session bridge (cmux): switch cmux to the workspace of another live session that runs in cmux, so the user can see it.',
+              description: `Session bridge (${host()}): switch ${host()} to the workspace of another live session that runs in it, so the user can see it.`,
               inputSchema: {
                 type: 'object',
                 properties: { name: { type: 'string', description: 'Session name, or a session-id prefix, from bridge_peers.' } },
@@ -659,8 +706,8 @@ export const register: Register = (on, options) => {
               },
               isDeferred: false,
             }),
-            $.command.register({ name: 'bridge-spawn', description: 'Session bridge (cmux): start a named session in a new cmux workspace', argumentHint: '<name> [role] [--skip-permissions] [-- first message]' }),
-            $.command.register({ name: 'bridge-focus', description: 'Session bridge (cmux): switch to another session\'s cmux workspace', argumentHint: '<name>' }),
+            $.command.register({ name: 'bridge-spawn', description: `Session bridge (${host()}): start a named session in ${cmux !== undefined ? 'a new cmux workspace' : 'a new Zendr space'}`, argumentHint: '<name> [role] [--skip-permissions] [-- first message]' }),
+            $.command.register({ name: 'bridge-focus', description: `Session bridge (${host()}): switch to another session's ${cmux !== undefined ? 'cmux workspace' : 'Zendr terminal'}`, argumentHint: '<name>' }),
           ]),
       $.command.register({ name: 'bridge', description: 'Session bridge: show peers and recent messages in a pane' }),
       $.command.register({ name: 'bridge-name', description: 'Session bridge: name this session (and set its role)', argumentHint: '<name> [role]' }),
@@ -686,6 +733,10 @@ export const register: Register = (on, options) => {
       if (cmux !== undefined) {
         lastStatus = ''
         await cmuxRun($, cmuxArgv.clearStatus(cmux))
+      }
+      if (zendr !== undefined) {
+        lastStatus = ''
+        await zendrRun($, zendrArgv.clearStatus(zendr))
       }
     }
     return next(e)
@@ -716,7 +767,7 @@ export const register: Register = (on, options) => {
     await showStatus($)
     if (isAuto) return next(e)
     $.ui.toast(`Session bridge: new ${message.kind} from ${message.from.name}. /bridge-inbox to read.`)
-    void cmuxNotify($, `New ${message.kind} from ${message.from.name}. Run /bridge-inbox to read.`)
+    void hostNotify($, `New ${message.kind} from ${message.from.name}. Run /bridge-inbox to read.`)
     return { consumed: 'session-bridge: manual delivery is on; held for /bridge-inbox' }
   })
 
@@ -909,7 +960,7 @@ export const register: Register = (on, options) => {
         {live.map(p => (
           <Box>
             <Text>{clip(`• ${p.name} (${p.role}) ${p.cwd}`, width - 12)} </Text>
-            {cmux !== undefined && p.cmux !== undefined && (
+            {((cmux !== undefined && p.cmux !== undefined) || (zendr !== undefined && p.zendr !== undefined)) && (
               <Button key={`focus-${p.id}`} label="Focus" onPress={() => void focus($, p.name)} />
             )}
           </Box>

@@ -1,7 +1,7 @@
 // Pure helpers for the session bridge: naming, addressing, liveness and the
 // text a message is delivered as. Nothing here touches `$`, so tests import it
 // directly.
-import type { BridgeEvent, BridgeKind, BridgeMessage, BridgePeer, CmuxRef } from '../types'
+import type { BridgeEvent, BridgeKind, BridgeMessage, BridgePeer, CmuxRef, ZendrRef } from '../types'
 
 export const KINDS: readonly BridgeKind[] = [
   'message',
@@ -419,4 +419,53 @@ export function fileArgv(isWindows: boolean): FileArgv {
     move: (from, to) => cmd('move', '/y', win(from), win(to)),
     remove: paths => cmd('del', '/f', '/q', ...paths.map(win)),
   }
+}
+
+// ---- Zendr ----------------------------------------------------------------
+//
+// Zendr (a desktop app built on Herdr: https://github.com/ruchira-edirisinghe/zendr) runs
+// each session in a terminal of its core, `hc`, which sets HC_TERMINAL_ID inside it. The
+// bridge talks to the app through that terminal's labels: `hc label <t> bridge.<what>=<json>`,
+// which Zendr's tab bar acts on. The same features as in cmux: the sidebar line
+// (bridge.status), a notification for a held message (bridge.notify), the tab's name
+// (bridge.title), showing a peer (bridge.focus) and a new session in a space of its own
+// (bridge.spawn).
+
+/** Where this process runs in Zendr, from its environment; nothing outside it. */
+export function zendrFromEnv(get: (key: string) => string | undefined): ZendrRef | undefined {
+  const terminal = (get('HC_TERMINAL_ID') ?? '').trim()
+  return terminal === '' ? undefined : { terminal }
+}
+
+const label = (ref: ZendrRef, key: string, value?: unknown): string[] => [
+  'hc', 'label', ref.terminal, `bridge.${key}=${value === undefined ? '' : JSON.stringify(value)}`,
+]
+
+/** `hc ...` argv lists. Each is run on its own and may fail without harm. */
+export const zendrArgv = {
+  ping: (ref: ZendrRef): string[] => ['hc', 'get', ref.terminal, '--json'],
+  setStatus: (ref: ZendrRef, text: string): string[] => label(ref, 'status', { text }),
+  clearStatus: (ref: ZendrRef): string[] => label(ref, 'status'),
+  notify: (ref: ZendrRef, id: string, title: string, body: string): string[] => label(ref, 'notify', { id, title, body }),
+  renameTab: (ref: ZendrRef, title: string): string[] => label(ref, 'title', { name: title }),
+  /** Asks Zendr to show the peer's terminal: the label goes on the peer's terminal. */
+  focus: (peer: ZendrRef, id: string): string[] => label(peer, 'focus', { id }),
+  /** Asks Zendr for a new space in `cwd` running `argv`. */
+  spawn: (ref: ZendrRef, request: { id: string; name: string; cwd: string; argv: string[] }): string[] =>
+    label(ref, 'spawn', request),
+}
+
+/**
+ * What a new Zendr space runs. On Windows, PowerShell: the `spawnCommand` option is then
+ * PowerShell, e.g. `$env:ANTHROPIC_BASE_URL='https://proxy.example'; claude`. Elsewhere,
+ * the login shell runs the same line cmux would.
+ */
+export function spawnArgv(options: SpawnOptions & { isWindows: boolean; shell?: string }): string[] {
+  if (!options.isWindows) return [options.shell || '/bin/sh', '-lc', spawnCommand(options)]
+  const flags = options.skipPermissions ? ' --dangerously-skip-permissions' : ''
+  const command = options.command?.replace(/[\r\n]+/g, ' ').trim() || 'claude'
+  return [
+    'powershell', '-NoLogo', '-NoExit', '-Command',
+    `$env:${ENV_NAME}='${options.name}'; $env:${ENV_ROLE}='${options.role}'; ${command}${flags}`,
+  ]
 }
