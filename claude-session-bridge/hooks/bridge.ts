@@ -1,7 +1,7 @@
 // Pure helpers for the session bridge: naming, addressing, liveness and the
 // text a message is delivered as. Nothing here touches `$`, so tests import it
 // directly.
-import type { BridgeEvent, BridgeKind, BridgeMessage, BridgePeer, CmuxRef } from '../types'
+import type { BridgeEvent, BridgeKind, BridgeMessage, BridgePeer, CmuxRef, ZendrRef } from '../types'
 
 export const KINDS: readonly BridgeKind[] = [
   'message',
@@ -32,7 +32,8 @@ export function sanitizeName(raw: string): string {
 }
 
 export function defaultName(cwd: string, sessionId: string): string {
-  const base = sanitizeName(cwd.split('/').filter(Boolean).at(-1) ?? 'session')
+  // A Windows folder (C:\Users\me\app) splits on backslashes too.
+  const base = sanitizeName(cwd.split(/[\\/]/).filter(Boolean).at(-1) ?? 'session')
   return `${base || 'session'}-${sessionId.slice(0, 4)}`
 }
 
@@ -381,4 +382,91 @@ export function parseSpawn(args: string): {
   const skipPermissions = words.includes('--skip-permissions')
   const [name = '', role = ''] = words.filter(word => word !== '--skip-permissions')
   return { name, role, skipPermissions, message }
+}
+
+// ---- files ----------------------------------------------------------------
+//
+// $.fs reads, writes and lists, but has no mkdir, rename or delete, so the bridge runs
+// those as commands. `mkdir`, `mv` and `rm` are not on a Windows PATH (Git Bash's live
+// only inside it): there it uses cmd's own, which act the same where it matters: a
+// move of a file another session already took fails, so the move is still the claim.
+
+/** The folder the bridge keeps its files in by default: `~/.claude/session-bridge`. */
+export function defaultRoot(get: (key: string) => string | undefined): string {
+  const home = (get('HOME') || get('USERPROFILE') || '').replace(/\\/g, '/').replace(/\/+$/, '')
+  return `${home}/.claude/session-bridge`
+}
+
+export type FileArgv = {
+  mkdir: (paths: string[]) => string[]
+  move: (from: string, to: string) => string[]
+  remove: (paths: string[]) => string[]
+}
+
+/** The argv for each file operation, on Windows or elsewhere. */
+export function fileArgv(isWindows: boolean): FileArgv {
+  if (!isWindows) {
+    return {
+      mkdir: paths => ['mkdir', '-p', ...paths],
+      move: (from, to) => ['mv', from, to],
+      remove: paths => ['rm', '-f', ...paths],
+    }
+  }
+  // cmd reads a leading "/" as a switch, so its paths take backslashes.
+  const win = (path: string) => path.replace(/\//g, '\\')
+  const cmd = (...argv: string[]) => ['cmd', '/d', '/c', ...argv]
+  return {
+    mkdir: paths => cmd('mkdir', ...paths.map(win)),
+    move: (from, to) => cmd('move', '/y', win(from), win(to)),
+    remove: paths => cmd('del', '/f', '/q', ...paths.map(win)),
+  }
+}
+
+// ---- Zendr ----------------------------------------------------------------
+//
+// Zendr (a desktop app built on Herdr: https://github.com/ruchira-edirisinghe/zendr) runs
+// each session in a terminal of its core, `hc`, which sets HC_TERMINAL_ID inside it. The
+// bridge talks to the app through that terminal's labels: `hc label <t> bridge.<what>=<json>`,
+// which Zendr's tab bar acts on. The same features as in cmux: the sidebar line
+// (bridge.status), a notification for a held message (bridge.notify), the tab's name
+// (bridge.title), showing a peer (bridge.focus) and a new session in a space of its own
+// (bridge.spawn).
+
+/** Where this process runs in Zendr, from its environment; nothing outside it. */
+export function zendrFromEnv(get: (key: string) => string | undefined): ZendrRef | undefined {
+  const terminal = (get('HC_TERMINAL_ID') ?? '').trim()
+  return terminal === '' ? undefined : { terminal }
+}
+
+const label = (ref: ZendrRef, key: string, value?: unknown): string[] => [
+  'hc', 'label', ref.terminal, `bridge.${key}=${value === undefined ? '' : JSON.stringify(value)}`,
+]
+
+/** `hc ...` argv lists. Each is run on its own and may fail without harm. */
+export const zendrArgv = {
+  ping: (ref: ZendrRef): string[] => ['hc', 'get', ref.terminal, '--json'],
+  setStatus: (ref: ZendrRef, text: string): string[] => label(ref, 'status', { text }),
+  clearStatus: (ref: ZendrRef): string[] => label(ref, 'status'),
+  notify: (ref: ZendrRef, id: string, title: string, body: string): string[] => label(ref, 'notify', { id, title, body }),
+  renameTab: (ref: ZendrRef, title: string): string[] => label(ref, 'title', { name: title }),
+  /** Asks Zendr to show the peer's terminal: the label goes on the peer's terminal. */
+  focus: (peer: ZendrRef, id: string): string[] => label(peer, 'focus', { id }),
+  /** Asks Zendr for a new space in `cwd` running `argv`. */
+  spawn: (ref: ZendrRef, request: { id: string; name: string; cwd: string; argv: string[] }): string[] =>
+    label(ref, 'spawn', request),
+}
+
+/**
+ * What a new Zendr space runs. On Windows, PowerShell: the `spawnCommand` option is then
+ * PowerShell, e.g. `$env:ANTHROPIC_BASE_URL='https://proxy.example'; claude`. Elsewhere,
+ * the login shell runs the same line cmux would.
+ */
+export function spawnArgv(options: SpawnOptions & { isWindows: boolean; shell?: string }): string[] {
+  if (!options.isWindows) return [options.shell || '/bin/sh', '-lc', spawnCommand(options)]
+  const flags = options.skipPermissions ? ' --dangerously-skip-permissions' : ''
+  const command = options.command?.replace(/[\r\n]+/g, ' ').trim() || 'claude'
+  return [
+    'powershell', '-NoLogo', '-NoExit', '-Command',
+    `$env:${ENV_NAME}='${options.name}'; $env:${ENV_ROLE}='${options.role}'; ${command}${flags}`,
+  ]
 }

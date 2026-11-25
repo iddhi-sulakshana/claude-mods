@@ -6,7 +6,12 @@ import {
   cmuxArgv,
   cmuxFromEnv,
   defaultName,
+  defaultRoot,
   EVENT_TTL_MS,
+  fileArgv,
+  spawnArgv,
+  zendrArgv,
+  zendrFromEnv,
   eventRecord,
   formatPeerText,
   formatPrompt,
@@ -38,6 +43,7 @@ describe('helpers', () => {
   test('names are sanitized and defaulted from the cwd', () => {
     expect(sanitizeName('  My Planner!! ')).toBe('my-planner')
     expect(defaultName('/Users/x/Codes/Web App', ME)).toBe('web-app-aaaa')
+    expect(defaultName('C:\\Users\\x\\Codes\\Web App', ME)).toBe('web-app-aaaa')
   })
 
   test('targets resolve to live peers, broadcasts, or an offline queue', () => {
@@ -61,6 +67,9 @@ describe('helpers', () => {
 function world(on: On, extraEnv: Record<string, string> = {}) {
   const files = new Map<string, string>()
   const cmuxCalls: string[][] = []
+  const hcCalls: string[][] = []
+  /** Every other command run: the file operations. */
+  const commands: string[][] = []
   const submitted: string[] = []
   const sent: { to: string; text: string }[] = []
   let refusal: string | undefined
@@ -99,17 +108,20 @@ function world(on: On, extraEnv: Record<string, string> = {}) {
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', () => ({ value: undefined }))
   on('ui.log', () => ({ value: undefined }))
+  // On Windows the engine hands these hooks absolute paths with a drive and backslashes
+  // (C:\bridge\...): keys stay in the /bridge/... form the tests read back.
+  const norm = (path: string) => path.replace(/\\/g, '/').replace(/^[A-Za-z]:(?=\/)/, '')
   on('fs.write', ($, e) => {
-    files.set(e.path, e.text)
+    files.set(norm(e.path), e.text)
     return { value: undefined }
   })
   on('fs.read', ($, e) => {
-    const text = files.get(e.path)
+    const text = files.get(norm(e.path))
     if (text === undefined) throw new Error(`ENOENT ${e.path}`)
     return { value: text }
   })
   on('fs.list', ($, e) => {
-    const prefix = `${e.path}/`
+    const prefix = `${norm(e.path)}/`
     const names = [...files.keys()]
       .filter(p => p.startsWith(prefix) && !p.slice(prefix.length).includes('/'))
       .map(p => p.slice(prefix.length))
@@ -117,22 +129,37 @@ function world(on: On, extraEnv: Record<string, string> = {}) {
   })
   on('process.run', ($, e) => ({ value: run(e.argv) }))
   const done = (exitCode: number) => ({ exitCode, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false })
-  const run = (argv: readonly string[]) => {
+  const move = (from: string, to: string) => {
+    const text = files.get(norm(from))
+    if (text === undefined) return done(1)
+    files.delete(norm(from))
+    files.set(norm(to), text)
+    return done(0)
+  }
+  const run = (argv: readonly string[]): ReturnType<typeof done> => {
     const [command, ...rest] = argv
     if (command === 'cmux') {
       cmuxCalls.push([...argv])
       return done(0)
     }
-    if (command === 'mv') {
-      const [from = '', to = ''] = rest
-      const text = files.get(from)
-      if (text === undefined) return done(1)
-      files.delete(from)
-      files.set(to, text)
+    if (command === 'hc') {
+      hcCalls.push([...argv])
       return done(0)
     }
+    commands.push([...argv])
+    // cmd's own, as the bridge runs them on Windows: cmd /d /c move|del|mkdir ...
+    if (command === 'cmd') {
+      const [, , op = '', ...args] = rest
+      if (op === 'move') return move(args[1] ?? '', args[2] ?? '')
+      if (op === 'del') {
+        for (const path of args.filter(a => !a.startsWith('/'))) files.delete(norm(path))
+        return done(0)
+      }
+      return done(op === 'mkdir' ? 0 : 1)
+    }
+    if (command === 'mv') return move(rest[0] ?? '', rest[1] ?? '')
     if (command === 'rm') {
-      for (const path of rest) files.delete(path)
+      for (const path of rest) files.delete(norm(path))
       return done(0)
     }
     return done(command === 'mkdir' ? 0 : 128)
@@ -145,6 +172,8 @@ function world(on: On, extraEnv: Record<string, string> = {}) {
   return {
     files,
     cmuxCalls,
+    hcCalls,
+    commands,
     submitted,
     sent,
     refuse: (reason: string) => {
@@ -668,5 +697,145 @@ describe('agentboard events', () => {
     expect(isExpiredEvent(`.${NOW - EVENT_TTL_MS - 1}-aaaaaa.tmp`, NOW)).toBe(true)
     expect(isExpiredEvent(`${NOW}-aaaaaa.json`, NOW)).toBe(false)
     expect(isExpiredEvent('notes.json', NOW)).toBe(false)
+  })
+})
+
+describe('files on Windows', () => {
+  test('the folder is under USERPROFILE when there is no HOME', () => {
+    expect(defaultRoot(key => ({ HOME: '/home/me' })[key])).toBe('/home/me/.claude/session-bridge')
+    expect(defaultRoot(key => ({ USERPROFILE: 'C:\\Users\\me' })[key])).toBe('C:/Users/me/.claude/session-bridge')
+  })
+
+  test('mkdir, mv and rm become cmd\'s own, with backslashes', () => {
+    expect(fileArgv(false).move('/a/b', '/c/d')).toEqual(['mv', '/a/b', '/c/d'])
+    expect(fileArgv(true).move('C:/a/b', 'C:/c/d')).toEqual(['cmd', '/d', '/c', 'move', '/y', 'C:\\a\\b', 'C:\\c\\d'])
+    expect(fileArgv(true).remove(['C:/a', 'C:/b'])).toEqual(['cmd', '/d', '/c', 'del', '/f', '/q', 'C:\\a', 'C:\\b'])
+    expect(fileArgv(true).mkdir(['C:/a/b'])).toEqual(['cmd', '/d', '/c', 'mkdir', 'C:\\a\\b'])
+  })
+
+  test('on Windows the inbox is claimed with cmd move, and the message still arrives', async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    mock.store(on)
+    const { files, submitted, commands } = world(on, { OS: 'Windows_NT' })
+    await $.session.start({ cwd: '/work/app', surface: 'terminal', isInteractive: true })
+    files.set(`${ROOT}/inbox/app-aaaa/${NOW}-abc123.json`, JSON.stringify(incoming()))
+    await clock.advance(2_000)
+    expect(submitted.length).toBe(1)
+    expect(commands.some(c => c[0] === 'cmd' && c[3] === 'move')).toBe(true)
+    expect(commands.some(c => c[0] === 'mv' || c[0] === 'mkdir' || c[0] === 'rm')).toBe(false)
+  })
+})
+
+const ZENDR_ENV = { HC_TERMINAL_ID: 't7' }
+const bridgeLabel = (calls: string[][], key: string) =>
+  calls.filter(c => c[1] === 'label' && c[3]?.startsWith(`bridge.${key}=`)).map(c => c[3]?.slice(`bridge.${key}=`.length) ?? '')
+
+describe('Zendr helpers', () => {
+  test('Zendr is detected from its terminal id, and only there', () => {
+    expect(zendrFromEnv(() => undefined)).toBeUndefined()
+    expect(zendrFromEnv(key => ({ HC_TERMINAL_ID: 't7' })[key])).toEqual({ terminal: 't7' })
+  })
+
+  test('requests go to Zendr as JSON labels on a terminal', () => {
+    const ref = { terminal: 't7' }
+    expect(zendrArgv.setStatus(ref, 'S')).toEqual(['hc', 'label', 't7', 'bridge.status={"text":"S"}'])
+    expect(zendrArgv.clearStatus(ref)).toEqual(['hc', 'label', 't7', 'bridge.status='])
+    expect(zendrArgv.renameTab(ref, 'planner (plan)')).toEqual(['hc', 'label', 't7', 'bridge.title={"name":"planner (plan)"}'])
+    expect(zendrArgv.focus({ terminal: 't9' }, 'X')).toEqual(['hc', 'label', 't9', 'bridge.focus={"id":"X"}'])
+  })
+
+  test('a spawned Zendr session runs in PowerShell on Windows, the login shell elsewhere', () => {
+    const win = spawnArgv({ name: 'builder', role: 'build', skipPermissions: false, isWindows: true })
+    expect(win.slice(0, 4)).toEqual(['powershell', '-NoLogo', '-NoExit', '-Command'])
+    expect(win[4]).toBe("$env:CLAUDE_SESSION_BRIDGE_NAME='builder'; $env:CLAUDE_SESSION_BRIDGE_ROLE='build'; claude")
+    expect(spawnArgv({ name: 'b', role: 'r', skipPermissions: true, isWindows: true })[4]).toContain('claude --dangerously-skip-permissions')
+    expect(spawnArgv({ name: 'b', role: 'r', skipPermissions: false, isWindows: false, shell: '/bin/zsh' })).toEqual([
+      '/bin/zsh', '-lc', 'CLAUDE_SESSION_BRIDGE_NAME=b CLAUDE_SESSION_BRIDGE_ROLE=r claude',
+    ])
+  })
+})
+
+describe('the bridge in Zendr', () => {
+  const start = ($: any) => $.session.start({ cwd: '/work/app', surface: 'terminal', isInteractive: true })
+
+  test('the peer file records the terminal, and the sidebar shows the bridge', async ($, on) => {
+    mock.clock(on, { now: NOW })
+    mock.store(on)
+    const { files, hcCalls } = world(on, ZENDR_ENV)
+    await start($)
+    const me = JSON.parse(files.get(`${ROOT}/sessions/${ME}.json`) ?? '{}') as BridgePeer
+    expect(me.zendr).toEqual({ terminal: 't7' })
+    expect(hcCalls[0]).toEqual(['hc', 'get', 't7', '--json'])
+    expect(JSON.parse(bridgeLabel(hcCalls, 'status')[0] ?? '{}').text).toContain('app-aaaa')
+  })
+
+  test('inside cmux, cmux wins and hc is never called', async ($, on) => {
+    mock.clock(on, { now: NOW })
+    mock.store(on)
+    const { files, hcCalls } = world(on, { ...CMUX_ENV, ...ZENDR_ENV })
+    await start($)
+    expect(hcCalls).toEqual([])
+    expect((JSON.parse(files.get(`${ROOT}/sessions/${ME}.json`) ?? '{}') as BridgePeer).zendr).toBeUndefined()
+  })
+
+  test('the zendr option off ignores Zendr', { options: { zendr: false } }, async ($, on) => {
+    mock.clock(on, { now: NOW })
+    mock.store(on)
+    const { hcCalls } = world(on, ZENDR_ENV)
+    await start($)
+    expect(hcCalls).toEqual([])
+  })
+
+  test('naming the session names its tab, and a held message notifies', async ($, on) => {
+    mock.clock(on, { now: NOW })
+    mock.store(on)
+    const { hcCalls } = world(on, ZENDR_ENV)
+    await start($)
+    await $.tool.call({ tool: 'mcp__session-bridge__bridge_identify', name: 'builder', role: 'build' } as never)
+    expect(bridgeLabel(hcCalls, 'title')).toContain('{"name":"builder (build)"}')
+    await $.command.run({ command: 'bridge-auto', args: 'off' } as never)
+    await $.session.receive({
+      agentId: undefined,
+      origin: { kind: 'peer', plugin: 'session-bridge' },
+      text: formatPeerText(incoming({ id: `${NOW}-zzz999`, to: 'builder' })),
+    } as never)
+    const note = JSON.parse(bridgeLabel(hcCalls, 'notify')[0] ?? '{}')
+    expect(note.title).toBe('Session bridge')
+    expect(note.body).toContain('planner')
+  })
+
+  test('bridge_spawn asks Zendr for a space running claude with the name, and queues the first message', async ($, on) => {
+    mock.clock(on, { now: NOW })
+    mock.store(on)
+    const { files, hcCalls } = world(on, { ...ZENDR_ENV, OS: 'Windows_NT' })
+    await start($)
+    const result = await $.tool.call({
+      tool: 'mcp__session-bridge__bridge_spawn',
+      name: 'Builder',
+      role: 'build',
+      cwd: 'C:/work/other',
+      message: 'Implement step 1.',
+    } as never)
+    expect(result.deny).toBeUndefined()
+    expect(String(result.result)).toContain('a new Zendr space')
+    const request = JSON.parse(bridgeLabel(hcCalls, 'spawn')[0] ?? '{}')
+    expect([request.name, request.cwd]).toEqual(['builder', 'C:/work/other'])
+    expect(request.argv[0]).toBe('powershell')
+    expect(request.argv.at(-1)).toContain("$env:CLAUDE_SESSION_BRIDGE_NAME='builder'")
+    expect(inboxFiles(files, 'builder').length).toBe(1)
+  })
+
+  test('bridge_focus shows a peer that runs in Zendr, and refuses one that does not', async ($, on) => {
+    mock.clock(on, { now: NOW })
+    mock.store(on)
+    const { files, hcCalls } = world(on, ZENDR_ENV)
+    files.set(`${ROOT}/sessions/bbbb2222-0000.json`, JSON.stringify(peer({ zendr: { terminal: 't9' } })))
+    files.set(`${ROOT}/sessions/cccc3333-0000.json`, JSON.stringify(peer({ id: 'cccc3333-0000', name: 'plain' })))
+    await start($)
+    const ok = await $.tool.call({ tool: 'mcp__session-bridge__bridge_focus', name: 'planner' } as never)
+    expect(ok.deny).toBeUndefined()
+    expect(hcCalls.some(c => c[1] === 'label' && c[2] === 't9' && c[3]?.startsWith('bridge.focus='))).toBe(true)
+    const no = await $.tool.call({ tool: 'mcp__session-bridge__bridge_focus', name: 'plain' } as never)
+    expect(no.deny).toContain('does not run in Zendr')
   })
 })

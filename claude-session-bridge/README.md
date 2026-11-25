@@ -101,6 +101,24 @@ Don't paste a key into this option. It is stored in your settings as plain text.
 
 Set the `cmux` option to `false` in `/config` → `session-bridge.cmux` to ignore cmux entirely, even inside it. Outside cmux nothing changes and the bridge never calls the `cmux` command.
 
+## Zendr (and Windows)
+
+[Zendr](https://github.com/ruchira-edirisinghe/zendr) is a desktop terminal app for coding agents built on [Herdr](https://github.com/herdrdev/herdr-app). It runs natively on Windows, including Windows on ARM. Each Claude Code session runs in a terminal of Herdr's core, `hc`, which sets `HC_TERMINAL_ID` inside it. When the bridge detects it (and not cmux), it adds the same features as in cmux:
+
+| cmux | Zendr |
+| --- | --- |
+| Sidebar status | The space's row in the sidebar shows the bridge line under its name. |
+| Notifications on held messages | A toast, the bell's unread badge in the tab bar, and an entry in the notifications panel (Ctrl+Shift+I; Ctrl+Shift+U jumps to the latest unread). |
+| Tab rename | The tab is renamed `name (role)`. |
+| `/bridge-spawn`, `bridge_spawn` | Opens a new Zendr space in the folder, running `claude` with the name and role set. |
+| `/bridge-focus`, `bridge_focus`, Focus button | Switches Zendr to that session's space, tab and pane. |
+
+The bridge talks to Zendr through its own terminal's labels (`hc label <terminal> bridge.<what>=<json>`), and Zendr's tab bar acts on them. Nothing else is needed: no socket and no extra process. Set the `zendr` option to `false` in `/config` → `session-bridge.zendr` to ignore Zendr. Inside cmux, cmux is used and `hc` is never called.
+
+On Windows a spawned session runs in PowerShell, so the `spawnCommand` option is PowerShell there, for example `$env:ANTHROPIC_BASE_URL='https://proxy.example'; claude`. Elsewhere the login shell (`$SHELL -lc`) runs the same line cmux would.
+
+The bridge also works on Windows outside Zendr. Its folder defaults to `%USERPROFILE%\.claude\session-bridge` when `HOME` is unset. It moves, creates and removes files with cmd's own `move`, `mkdir` and `del`, because `mv`, `mkdir` and `rm` aren't on a Windows PATH. A move of a message another session already took still fails, so the move is still the claim.
+
 ## Install
 
 In a Claude Code terminal session:
@@ -109,7 +127,7 @@ In a Claude Code terminal session:
 /plugin install session-bridge --marketplace iddhi-sulakshana/claude-mods
 ```
 
-You can configure it in `/config`: `session-bridge.autoDeliver` (default `true`) and `session-bridge.cmux` (default `true`).
+You can configure it in `/config`: `session-bridge.autoDeliver` (default `true`), `session-bridge.cmux` (default `true`) and `session-bridge.zendr` (default `true`).
 
 ## Develop
 

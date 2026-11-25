@@ -12,6 +12,11 @@ export type CmuxRef = {
   surface?: string
 }
 
+/** Where a session runs inside Zendr (Herdr's core): its terminal (HC_TERMINAL_ID). */
+export type ZendrRef = {
+  terminal: string
+}
+
 export type BridgePeer = {
   id: string
   name: string
@@ -20,6 +25,8 @@ export type BridgePeer = {
   updatedAt: number
   /** Set when the session runs inside cmux, so peers can focus its workspace. */
   cmux?: CmuxRef
+  /** Set when the session runs inside Zendr, so peers can show its terminal. */
+  zendr?: ZendrRef
 }
 
 export type BridgeMessage = {
