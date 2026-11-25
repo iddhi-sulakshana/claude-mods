@@ -32,7 +32,8 @@ export function sanitizeName(raw: string): string {
 }
 
 export function defaultName(cwd: string, sessionId: string): string {
-  const base = sanitizeName(cwd.split('/').filter(Boolean).at(-1) ?? 'session')
+  // A Windows folder (C:\Users\me\app) splits on backslashes too.
+  const base = sanitizeName(cwd.split(/[\\/]/).filter(Boolean).at(-1) ?? 'session')
   return `${base || 'session'}-${sessionId.slice(0, 4)}`
 }
 

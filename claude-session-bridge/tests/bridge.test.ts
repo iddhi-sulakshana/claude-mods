@@ -43,6 +43,7 @@ describe('helpers', () => {
   test('names are sanitized and defaulted from the cwd', () => {
     expect(sanitizeName('  My Planner!! ')).toBe('my-planner')
     expect(defaultName('/Users/x/Codes/Web App', ME)).toBe('web-app-aaaa')
+    expect(defaultName('C:\\Users\\x\\Codes\\Web App', ME)).toBe('web-app-aaaa')
   })
 
   test('targets resolve to live peers, broadcasts, or an offline queue', () => {
