@@ -10,6 +10,8 @@ import {
   cmuxArgv,
   cmuxFromEnv,
   defaultName,
+  defaultRoot,
+  fileArgv,
   describePeers,
   formatDelivery,
   eventRecord,
@@ -59,6 +61,9 @@ let rebasing: Promise<BridgePeer> | undefined
 let cmux: CmuxRef | undefined
 /** What a spawned session runs (the `spawnCommand` option); empty means `claude`. */
 let spawnBin = ''
+let isWindows = false
+/** mkdir, mv and rm, or cmd's own on Windows. */
+let files = fileArgv(false)
 
 const dirs = {
   sessions: () => `${root}/sessions`,
@@ -126,14 +131,14 @@ function rebase($: $, held: BridgePeer | null): Promise<BridgePeer> {
       stored && !isTaken(stored.name) ? stored : (before ?? { name: defaultName(cwd, id), role: 'general' })
     const self: BridgePeer = { id, name: identity.name, role: identity.role, cwd, updatedAt: now, ...(cmux ? { cmux } : {}) }
 
-    if (before !== null && before.id !== id) await sh($, ['rm', '-f', sessionFile(before.id)])
+    if (before !== null && before.id !== id) await sh($, files.remove([sessionFile(before.id)]))
     await update($, meAtom, () => self)
     if (held === null) {
       await update($, autoAtom, () => kept?.isAuto ?? autoDefault)
       if (kept) await update($, logAtom, () => kept.log)
     }
     await $.store.set(`identity:${id}`, { name: self.name, role: self.role })
-    await sh($, ['mkdir', '-p', dirs.sessions(), dirs.inbox(self.name), dirs.archive(self.name)])
+    await sh($, files.mkdir([dirs.sessions(), dirs.inbox(self.name), dirs.archive(self.name)]))
     await $.fs.write(sessionFile(id), JSON.stringify(self))
     $.ui.log(`session-bridge: now session ${id.slice(0, 8)} as "${self.name}"`, { to: 'debug' })
     arm($)
@@ -195,14 +200,14 @@ async function heartbeat($: $) {
   for (const peer of peers) {
     // Sessions that died without a session.end leave a file behind; sweep old ones.
     if (peer.id !== next.id && now - peer.updatedAt > 10 * STALE_MS) {
-      await sh($, ['rm', '-f', sessionFile(peer.id)])
+      await sh($, files.remove([sessionFile(peer.id)]))
     }
   }
   await update($, peersAtom, () => peers.filter(p => now - p.updatedAt <= 10 * STALE_MS))
 
   const events = await $.fs.list(dirs.events()).catch(() => [])
   const expired = events.filter(entry => entry.kind === 'file' && isExpiredEvent(entry.name, now))
-  if (expired.length > 0) await sh($, ['rm', '-f', ...expired.map(entry => `${dirs.events()}/${entry.name}`)])
+  if (expired.length > 0) await sh($, files.remove(expired.map(entry => `${dirs.events()}/${entry.name}`)))
   await showStatus($)
 }
 
@@ -267,7 +272,7 @@ async function poll($: $) {
     const claimed: BridgeMessage[] = []
     for (const name of waiting) {
       const archived = `${dirs.archive(self.name)}/${name}`
-      if (!(await sh($, ['mv', `${inbox}/${name}`, archived]))) continue
+      if (!(await sh($, files.move(`${inbox}/${name}`, archived)))) continue
       try {
         const message = JSON.parse(await $.fs.read(archived)) as BridgeMessage
         if (!seen.has(message.id)) claimed.push(message)
@@ -298,7 +303,7 @@ async function poll($: $) {
 async function writeEvent($: $, event: BridgeEvent) {
   const temp = `${dirs.events()}/.${event.id}.tmp`
   await $.fs.write(temp, JSON.stringify(event))
-  return sh($, ['mv', temp, `${dirs.events()}/${event.id}.json`])
+  return sh($, files.move(temp, `${dirs.events()}/${event.id}.json`))
 }
 
 /** Writes a message into an inbox: temp file first, then a rename, so a reader never sees half of it. */
@@ -306,7 +311,7 @@ async function enqueue($: $, message: BridgeMessage) {
   const inbox = dirs.inbox(message.to)
   const temp = `${inbox}/.${message.id}.tmp`
   await $.fs.write(temp, JSON.stringify(message))
-  return sh($, ['mv', temp, `${inbox}/${message.id}.json`])
+  return sh($, files.move(temp, `${inbox}/${message.id}.json`))
 }
 
 /**
@@ -439,7 +444,7 @@ async function setIdentity($: $, rawName: string | undefined, rawRole: string | 
 
   await update($, meAtom, () => ({ ...self, name, role }))
   await $.store.set(`identity:${self.id}`, { name, role })
-  await sh($, ['mkdir', '-p', dirs.inbox(name), dirs.archive(name)])
+  await sh($, files.mkdir([dirs.inbox(name), dirs.archive(name)]))
   // The tab carries the name the session plays, so a row of cmux tabs reads planner / builder / auditor.
   if (cmux !== undefined) await cmuxRun($, cmuxArgv.renameTab(cmux, tabTitle(name, role)))
   await heartbeat($)
@@ -468,7 +473,7 @@ async function spawn(
 
   const role = sanitizeName(input.role ?? '') || 'general'
   const cwd = input.cwd?.trim() || self.cwd
-  await sh($, ['mkdir', '-p', dirs.inbox(name), dirs.archive(name)])
+  await sh($, files.mkdir([dirs.inbox(name), dirs.archive(name)]))
   if (!(await cmuxRun($, cmuxArgv.spawn(cwd, spawnCommand({ name, role, skipPermissions: input.skipPermissions, command: spawnBin }))))) {
     return { ok: false, reason: 'cmux could not open a new workspace (is cmux running, and is the folder there?).' }
   }
@@ -514,8 +519,10 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
 
-    const home = (await $.env.get('HOME')) ?? ''
-    root = (await $.env.get('CLAUDE_SESSION_BRIDGE_DIR')) ?? `${home}/.claude/session-bridge`
+    const home: Record<string, string | undefined> = { HOME: await $.env.get('HOME'), USERPROFILE: await $.env.get('USERPROFILE') }
+    root = (await $.env.get('CLAUDE_SESSION_BRIDGE_DIR')) ?? defaultRoot(key => home[key])
+    isWindows = (await $.env.get('OS')) === 'Windows_NT'
+    files = fileArgv(isWindows)
     autoDefault = options.autoDeliver !== false
     spawnBin = typeof options.spawnCommand === 'string' ? options.spawnCommand : ''
 
@@ -553,7 +560,7 @@ export const register: Register = (on, options) => {
     if (version === 0) await update($, autoAtom, () => autoDefault)
 
     const name = (await me($)).name
-    await sh($, ['mkdir', '-p', dirs.sessions(), dirs.handoffs(), dirs.events(), dirs.inbox(name), dirs.archive(name)])
+    await sh($, files.mkdir([dirs.sessions(), dirs.handoffs(), dirs.events(), dirs.inbox(name), dirs.archive(name)]))
 
     if (cmux !== undefined && stored === undefined && envName !== '') {
       await cmuxRun($, cmuxArgv.renameTab(cmux, tabTitle(self.name, self.role)))
@@ -675,7 +682,7 @@ export const register: Register = (on, options) => {
       // After a /clear or a /resume the process goes on as another session,
       // whose state may start empty: keep what this one held for it.
       carried = { me: await read($, meAtom), log: await read($, logAtom), isAuto: await read($, autoAtom) }
-      await sh($, ['rm', '-f', sessionFile(e.sessionId)])
+      await sh($, files.remove([sessionFile(e.sessionId)]))
       if (cmux !== undefined) {
         lastStatus = ''
         await cmuxRun($, cmuxArgv.clearStatus(cmux))

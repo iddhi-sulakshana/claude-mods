@@ -101,6 +101,10 @@ Don't paste a key into this option. It is stored in your settings as plain text.
 
 Set the `cmux` option to `false` in `/config` → `session-bridge.cmux` to ignore cmux entirely, even inside it. Outside cmux nothing changes and the bridge never calls the `cmux` command.
 
+## Windows
+
+The bridge works on Windows. Its folder defaults to `%USERPROFILE%\.claude\session-bridge` when `HOME` is unset. It moves, creates and removes files with cmd's own `move`, `mkdir` and `del`, because `mv`, `mkdir` and `rm` aren't on a Windows PATH. A move of a message another session already took still fails, so the move is still the claim.
+
 ## Install
 
 In a Claude Code terminal session:

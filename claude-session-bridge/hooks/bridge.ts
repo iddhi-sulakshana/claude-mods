@@ -382,3 +382,41 @@ export function parseSpawn(args: string): {
   const [name = '', role = ''] = words.filter(word => word !== '--skip-permissions')
   return { name, role, skipPermissions, message }
 }
+
+// ---- files ----------------------------------------------------------------
+//
+// $.fs reads, writes and lists, but has no mkdir, rename or delete, so the bridge runs
+// those as commands. `mkdir`, `mv` and `rm` are not on a Windows PATH (Git Bash's live
+// only inside it): there it uses cmd's own, which act the same where it matters: a
+// move of a file another session already took fails, so the move is still the claim.
+
+/** The folder the bridge keeps its files in by default: `~/.claude/session-bridge`. */
+export function defaultRoot(get: (key: string) => string | undefined): string {
+  const home = (get('HOME') || get('USERPROFILE') || '').replace(/\\/g, '/').replace(/\/+$/, '')
+  return `${home}/.claude/session-bridge`
+}
+
+export type FileArgv = {
+  mkdir: (paths: string[]) => string[]
+  move: (from: string, to: string) => string[]
+  remove: (paths: string[]) => string[]
+}
+
+/** The argv for each file operation, on Windows or elsewhere. */
+export function fileArgv(isWindows: boolean): FileArgv {
+  if (!isWindows) {
+    return {
+      mkdir: paths => ['mkdir', '-p', ...paths],
+      move: (from, to) => ['mv', from, to],
+      remove: paths => ['rm', '-f', ...paths],
+    }
+  }
+  // cmd reads a leading "/" as a switch, so its paths take backslashes.
+  const win = (path: string) => path.replace(/\//g, '\\')
+  const cmd = (...argv: string[]) => ['cmd', '/d', '/c', ...argv]
+  return {
+    mkdir: paths => cmd('mkdir', ...paths.map(win)),
+    move: (from, to) => cmd('move', '/y', win(from), win(to)),
+    remove: paths => cmd('del', '/f', '/q', ...paths.map(win)),
+  }
+}

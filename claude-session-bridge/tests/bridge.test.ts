@@ -6,7 +6,9 @@ import {
   cmuxArgv,
   cmuxFromEnv,
   defaultName,
+  defaultRoot,
   EVENT_TTL_MS,
+  fileArgv,
   eventRecord,
   formatPeerText,
   formatPrompt,
@@ -61,6 +63,8 @@ describe('helpers', () => {
 function world(on: On, extraEnv: Record<string, string> = {}) {
   const files = new Map<string, string>()
   const cmuxCalls: string[][] = []
+  /** Every other command run: the file operations. */
+  const commands: string[][] = []
   const submitted: string[] = []
   const sent: { to: string; text: string }[] = []
   let refusal: string | undefined
@@ -99,17 +103,20 @@ function world(on: On, extraEnv: Record<string, string> = {}) {
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', () => ({ value: undefined }))
   on('ui.log', () => ({ value: undefined }))
+  // On Windows the engine hands these hooks absolute paths with a drive and backslashes
+  // (C:\bridge\...): keys stay in the /bridge/... form the tests read back.
+  const norm = (path: string) => path.replace(/\\/g, '/').replace(/^[A-Za-z]:(?=\/)/, '')
   on('fs.write', ($, e) => {
-    files.set(e.path, e.text)
+    files.set(norm(e.path), e.text)
     return { value: undefined }
   })
   on('fs.read', ($, e) => {
-    const text = files.get(e.path)
+    const text = files.get(norm(e.path))
     if (text === undefined) throw new Error(`ENOENT ${e.path}`)
     return { value: text }
   })
   on('fs.list', ($, e) => {
-    const prefix = `${e.path}/`
+    const prefix = `${norm(e.path)}/`
     const names = [...files.keys()]
       .filter(p => p.startsWith(prefix) && !p.slice(prefix.length).includes('/'))
       .map(p => p.slice(prefix.length))
@@ -117,22 +124,33 @@ function world(on: On, extraEnv: Record<string, string> = {}) {
   })
   on('process.run', ($, e) => ({ value: run(e.argv) }))
   const done = (exitCode: number) => ({ exitCode, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false })
-  const run = (argv: readonly string[]) => {
+  const move = (from: string, to: string) => {
+    const text = files.get(norm(from))
+    if (text === undefined) return done(1)
+    files.delete(norm(from))
+    files.set(norm(to), text)
+    return done(0)
+  }
+  const run = (argv: readonly string[]): ReturnType<typeof done> => {
     const [command, ...rest] = argv
     if (command === 'cmux') {
       cmuxCalls.push([...argv])
       return done(0)
     }
-    if (command === 'mv') {
-      const [from = '', to = ''] = rest
-      const text = files.get(from)
-      if (text === undefined) return done(1)
-      files.delete(from)
-      files.set(to, text)
-      return done(0)
+    commands.push([...argv])
+    // cmd's own, as the bridge runs them on Windows: cmd /d /c move|del|mkdir ...
+    if (command === 'cmd') {
+      const [, , op = '', ...args] = rest
+      if (op === 'move') return move(args[1] ?? '', args[2] ?? '')
+      if (op === 'del') {
+        for (const path of args.filter(a => !a.startsWith('/'))) files.delete(norm(path))
+        return done(0)
+      }
+      return done(op === 'mkdir' ? 0 : 1)
     }
+    if (command === 'mv') return move(rest[0] ?? '', rest[1] ?? '')
     if (command === 'rm') {
-      for (const path of rest) files.delete(path)
+      for (const path of rest) files.delete(norm(path))
       return done(0)
     }
     return done(command === 'mkdir' ? 0 : 128)
@@ -145,6 +163,7 @@ function world(on: On, extraEnv: Record<string, string> = {}) {
   return {
     files,
     cmuxCalls,
+    commands,
     submitted,
     sent,
     refuse: (reason: string) => {
@@ -668,5 +687,31 @@ describe('agentboard events', () => {
     expect(isExpiredEvent(`.${NOW - EVENT_TTL_MS - 1}-aaaaaa.tmp`, NOW)).toBe(true)
     expect(isExpiredEvent(`${NOW}-aaaaaa.json`, NOW)).toBe(false)
     expect(isExpiredEvent('notes.json', NOW)).toBe(false)
+  })
+})
+
+describe('files on Windows', () => {
+  test('the folder is under USERPROFILE when there is no HOME', () => {
+    expect(defaultRoot(key => ({ HOME: '/home/me' })[key])).toBe('/home/me/.claude/session-bridge')
+    expect(defaultRoot(key => ({ USERPROFILE: 'C:\\Users\\me' })[key])).toBe('C:/Users/me/.claude/session-bridge')
+  })
+
+  test('mkdir, mv and rm become cmd\'s own, with backslashes', () => {
+    expect(fileArgv(false).move('/a/b', '/c/d')).toEqual(['mv', '/a/b', '/c/d'])
+    expect(fileArgv(true).move('C:/a/b', 'C:/c/d')).toEqual(['cmd', '/d', '/c', 'move', '/y', 'C:\\a\\b', 'C:\\c\\d'])
+    expect(fileArgv(true).remove(['C:/a', 'C:/b'])).toEqual(['cmd', '/d', '/c', 'del', '/f', '/q', 'C:\\a', 'C:\\b'])
+    expect(fileArgv(true).mkdir(['C:/a/b'])).toEqual(['cmd', '/d', '/c', 'mkdir', 'C:\\a\\b'])
+  })
+
+  test('on Windows the inbox is claimed with cmd move, and the message still arrives', async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    mock.store(on)
+    const { files, submitted, commands } = world(on, { OS: 'Windows_NT' })
+    await $.session.start({ cwd: '/work/app', surface: 'terminal', isInteractive: true })
+    files.set(`${ROOT}/inbox/app-aaaa/${NOW}-abc123.json`, JSON.stringify(incoming()))
+    await clock.advance(2_000)
+    expect(submitted.length).toBe(1)
+    expect(commands.some(c => c[0] === 'cmd' && c[3] === 'move')).toBe(true)
+    expect(commands.some(c => c[0] === 'mv' || c[0] === 'mkdir' || c[0] === 'rm')).toBe(false)
   })
 })
