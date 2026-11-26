@@ -14,7 +14,17 @@ The models form a ladder: Opus 5.5 at the top, then Sonnet 5.5, then Haiku 5.5. 
 
 When you submit a prompt, the router stores its text. At the turn's first model request it classifies the prompt with the `classifier` setting.
 
-### `laya` (default): the local Laya decision server
+### `auto` (default): Laya when it answers, else a Claude model
+
+Most computers have no Laya server, so the default works without one. The router asks Laya first, giving it 2 s. If Laya is unreachable, slow, or answers with an error (another program on its port, say), the `model` classifier below decides the turn instead, and the log line says why:
+
+```
+router: mechanical [laya unreachable (…), so haiku classified it; …] → effort medium → low, …
+```
+
+After a failure Laya is left alone for 10 minutes, so a computer without it pays for the try once, not on every turn. Pick `laya` or `model` to use only one of them.
+
+### `laya`: the local Laya decision server
 
 The router posts the prompt alone to laya-serve at `layaUrl` (default `http://127.0.0.1:8765/v1/systemone`). It asks Laya's own router questions: `difficulty` (trivial, easy, moderate or hard) and `is_sensitive` (money, legal, medical or safety). There's no API cost, and a warm server answers in about 0.5 s. If Laya hasn't answered within 5 s, the request goes out unchanged.
 

@@ -23,6 +23,12 @@ type $ = EngineInterface
 
 /** A warm Laya answers in well under a second; past this the turn goes out unchanged. */
 const LAYA_TIMEOUT_MS = 5_000
+/** With the auto classifier, how long Laya may take before the Claude model classifies instead. */
+const AUTO_LAYA_TIMEOUT_MS = 2_000
+/** With the auto classifier, how long a Laya that failed is left alone (most computers have none). */
+const LAYA_RETRY_MS = 10 * 60_000
+/** Until when (clock ms) the auto classifier skips Laya. */
+let layaDownUntil = 0
 
 const pausedAtom = atom({ plugin: 'model-router', key: 'isPaused' } as const, false)
 const switchAtom = atom({ plugin: 'model-router', key: 'modelSwitch' } as const, null)
@@ -59,10 +65,10 @@ async function previousReply($: $): Promise<string | undefined> {
 }
 
 /** Asks the local Laya server; a string says why there is no decision. */
-async function classifyWithLaya($: $, text: string): Promise<Decision | string> {
+async function classifyWithLaya($: $, text: string, timeoutMs = LAYA_TIMEOUT_MS): Promise<Decision | string> {
   const stop = new AbortController()
   const timeout = $.clock
-    .sleep(LAYA_TIMEOUT_MS, { signal: stop.signal })
+    .sleep(timeoutMs, { signal: stop.signal })
     .then(() => 'timeout' as const)
     .catch(() => 'cancelled' as const)
   const request = $.http.fetch(`${config.layaUrl}/v1/systemone`, {
@@ -72,7 +78,7 @@ async function classifyWithLaya($: $, text: string): Promise<Decision | string> 
   })
   try {
     const response = await Promise.race([request, timeout])
-    if (response === 'timeout') return `laya gave no answer within ${LAYA_TIMEOUT_MS / 1000}s`
+    if (response === 'timeout') return `laya gave no answer within ${timeoutMs / 1000}s`
     if (response === 'cancelled') return 'laya call cancelled'
     if (!response.ok) return `laya answered HTTP ${response.status}`
     const reading = parseLaya(response.text)
@@ -102,6 +108,23 @@ async function classifyWithModel($: $, text: string, reply: string | undefined):
   return decide(verdict, highStakesSignals(text))
 }
 
+/**
+ * The auto classifier: Laya when it answers, else the Claude model. A Laya that fails is
+ * skipped for LAYA_RETRY_MS, so a computer without one pays for the try once, not every turn.
+ */
+async function classifyAuto($: $, text: string): Promise<Decision | string> {
+  const now = await $.clock.now()
+  let why = 'laya skipped (it failed recently)'
+  if (now >= layaDownUntil) {
+    const laya = await classifyWithLaya($, text, AUTO_LAYA_TIMEOUT_MS)
+    if (typeof laya !== 'string') return laya
+    layaDownUntil = now + LAYA_RETRY_MS
+    why = laya
+  }
+  const model = await classifyWithModel($, text, await previousReply($).catch(() => undefined))
+  return typeof model === 'string' ? `${why}; ${model}` : { ...model, why: [`${why}, so ${config.classifierModel} classified it`, ...model.why] }
+}
+
 /** Classifies the prompt that starts this turn and plans its requests; undefined sends them unchanged. */
 async function routeTurn($: $, e: TurnStepInput): Promise<Plan | undefined> {
   const text = pending
@@ -115,7 +138,9 @@ async function routeTurn($: $, e: TurnStepInput): Promise<Plan | undefined> {
     ? continuationDecision(await read($, lastTierAtom))
     : config.classifier === 'laya'
       ? await classifyWithLaya($, text)
-      : await classifyWithModel($, text, await previousReply($).catch(() => undefined))
+      : config.classifier === 'auto'
+        ? await classifyAuto($, text)
+        : await classifyWithModel($, text, await previousReply($).catch(() => undefined))
   if (typeof classified === 'string') {
     await record($, `router: ${classified} → request unchanged`)
     return undefined
@@ -157,7 +182,10 @@ async function status($: $): Promise<string> {
     `Model router: ${isPaused ? 'paused for this session' : 'routing'}`,
     `Effort routing: ${config.routeEffort ? `on (mechanical ≤ ${config.mechanicalEffort}, hard ≥ ${config.hardEffort})` : 'off'}`,
     `Main-model switching: ${isSwitching ? 'on' : 'off'}${modelSwitch === null ? ' (setting)' : ' (this session)'}; hard → ${config.strongModel}, ordinary → ${config.ordinaryModel}, mechanical → ${config.cheapModel}`,
-    `Classifier: ${config.classifier === 'laya' ? `laya at ${config.layaUrl}` : config.classifierModel}`,
+    `Classifier: ${
+      config.classifier === 'laya' ? `laya at ${config.layaUrl}`
+        : config.classifier === 'auto' ? `auto: laya at ${config.layaUrl} when it answers, else ${config.classifierModel}`
+          : config.classifierModel}`,
     `Last decision: ${last ?? 'none yet'}`,
   ].join('\n')
 }

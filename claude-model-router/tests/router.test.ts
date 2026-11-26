@@ -72,6 +72,7 @@ describe('rules', () => {
 })
 
 const MODEL = { options: { classifier: 'model' } }
+const LAYA = { options: { classifier: 'laya' } }
 
 const STEP: TurnStepInput = { turnId: 't1', index: 0, model: 'claude-opus-5-5', effort: 'medium', messageCount: 3 }
 
@@ -285,7 +286,7 @@ function layaWorld(on: On, answer: () => Promise<{ status: number; text: string 
 }
 
 describe('a turn classified by laya', () => {
-  test('a hard reading raises effort and names laya in the log', async ($, on) => {
+  test('a hard reading raises effort and names laya in the log', LAYA, async ($, on) => {
     const { logs, sent, posted } = layaWorld(on, async () => ({ status: 200, text: layaAnswer([0.01, 0.14, 0.53, 0.32], 0.08) }))
     await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
     await $.prompt.submit(typed('design the multi-tenant architecture'))
@@ -297,7 +298,7 @@ describe('a turn classified by laya', () => {
     expect(logs.at(-1)).toContain('router: hard [laya difficulty')
   })
 
-  test('a laya error sends the request unchanged', async ($, on) => {
+  test('a laya error sends the request unchanged', LAYA, async ($, on) => {
     const { logs, sent } = layaWorld(on, async () => ({ status: 500, text: 'boom' }))
     await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
     await $.prompt.submit(typed('rename foo'))
@@ -307,7 +308,7 @@ describe('a turn classified by laya', () => {
     expect(logs.at(-1)).toBe('router: laya answered HTTP 500 → request unchanged')
   })
 
-  test('an unreachable laya sends the request unchanged', async ($, on) => {
+  test('an unreachable laya sends the request unchanged', LAYA, async ($, on) => {
     const { logs, sent } = layaWorld(on, async () => {
       throw new Error('ECONNREFUSED 127.0.0.1:8765')
     })
@@ -319,7 +320,7 @@ describe('a turn classified by laya', () => {
     expect(logs.at(-1)).toContain('router: laya unreachable')
   })
 
-  test('a laya that does not answer in time sends the request unchanged', async ($, on) => {
+  test('a laya that does not answer in time sends the request unchanged', LAYA, async ($, on) => {
     const { logs, sent, clock } = layaWorld(on, () => new Promise(() => undefined))
     await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
     await $.prompt.submit(typed('rename foo'))
@@ -331,7 +332,7 @@ describe('a turn classified by laya', () => {
     expect(logs.at(-1)).toBe('router: laya gave no answer within 5s → request unchanged')
   })
 
-  test('a continuation inherits the previous tier without asking laya', async ($, on) => {
+  test('a continuation inherits the previous tier without asking laya', LAYA, async ($, on) => {
     const { logs, sent, posted } = layaWorld(on, async () => ({ status: 200, text: layaAnswer([0.01, 0.14, 0.53, 0.32], 0.08) }))
     await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
     await $.prompt.submit(typed('plan the token migration across services'))
@@ -342,5 +343,71 @@ describe('a turn classified by laya', () => {
     expect(posted.length).toBe(1)
     expect(sent.map(s => s.effort)).toEqual(['xhigh', 'xhigh'])
     expect(logs.at(-1)).toContain('continuation of the previous turn (hard)')
+  })
+})
+
+/** Laya over HTTP and a Claude model beneath the router, for the auto classifier. */
+function autoWorld(on: On, laya: () => Promise<{ status: number; text: string }>, verdict: string) {
+  const world = layaWorld(on, laya)
+  const asked: string[] = []
+  on('model.complete', ($, e) => {
+    asked.push(e.prompt)
+    return {
+      value: {
+        isAnswered: true as const,
+        text: verdict,
+        usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      },
+    }
+  })
+  return { ...world, asked }
+}
+
+describe('the auto classifier (the default)', () => {
+  test('uses laya when it answers, and asks no model', async ($, on) => {
+    const { logs, sent, asked } = autoWorld(on, async () => ({ status: 200, text: layaAnswer([0.01, 0.14, 0.53, 0.32], 0.08) }), VERDICT('mechanical', 0.99))
+    await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+    await $.prompt.submit(typed('design the multi-tenant architecture'))
+    await runStep($, STEP)
+
+    expect(asked).toEqual([])
+    expect(sent[0]?.effort).toBe('xhigh')
+    expect(logs.at(-1)).toContain('router: hard [laya difficulty')
+  })
+
+  test('without a laya server, the Claude model classifies, and laya is left alone for ten minutes', async ($, on) => {
+    const { logs, sent, posted, asked, clock } = autoWorld(on, async () => {
+      throw new Error('ECONNREFUSED 127.0.0.1:8765')
+    }, VERDICT('mechanical', 0.95))
+    await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+    await $.prompt.submit(typed('fix the typo in the readme'))
+    await runStep($, { ...STEP, turnId: 't1' })
+
+    expect(posted.length).toBe(1)
+    expect(asked.length).toBe(1)
+    expect(sent[0]?.effort).toBe('low')
+    expect(logs.at(-1)).toContain('laya unreachable')
+    expect(logs.at(-1)).toContain('so haiku classified it')
+
+    await $.prompt.submit(typed('fix the other typo too'))
+    await runStep($, { ...STEP, turnId: 't2' })
+    expect(posted.length).toBe(1)
+    expect(asked.length).toBe(2)
+    expect(logs.at(-1)).toContain('laya skipped (it failed recently)')
+
+    await clock.advance(10 * 60_000)
+    await $.prompt.submit(typed('rename the helper'))
+    await runStep($, { ...STEP, turnId: 't3' })
+    expect(posted.length).toBe(2)
+  })
+
+  test('a laya answering something else (another server on the port) falls back too', async ($, on) => {
+    const { sent, asked } = autoWorld(on, async () => ({ status: 404, text: 'Not Found' }), VERDICT('hard', 0.9))
+    await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+    await $.prompt.submit(typed('migrate the payments database'))
+    await runStep($, STEP)
+
+    expect(asked.length).toBe(1)
+    expect(sent[0]?.effort).toBe('xhigh')
   })
 })

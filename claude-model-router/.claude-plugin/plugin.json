@@ -1,6 +1,6 @@
 {
   "name": "model-router",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Classifies each turn as mechanical, ordinary or hard and routes it to a matching model and reasoning effort, logging every decision.",
   "author": {
     "name": "iddhi"
@@ -40,12 +40,13 @@
     "classifier": {
       "type": "string",
       "title": "Classifier",
-      "description": "laya: the local Laya decision server (no API cost, ~0.5s warm). model: a Claude model (classifierModel).",
+      "description": "auto (default): the local Laya decision server when it answers, else a Claude model (classifierModel), so it works on any computer. laya: Laya only (no API cost, ~0.5s warm). model: a Claude model only.",
       "options": [
+        "auto",
         "laya",
         "model"
       ],
-      "default": "laya"
+      "default": "auto"
     },
     "layaUrl": {
       "type": "string",
@@ -56,7 +57,7 @@
     "classifierModel": {
       "type": "string",
       "title": "Classifier model",
-      "description": "Claude model that classifies each turn when classifier is \"model\".",
+      "description": "Claude model that classifies each turn when classifier is \"model\", or \"auto\" without a Laya server.",
       "default": "haiku"
     },
     "mechanicalEffort": {

@@ -238,7 +238,8 @@ export function decideFromLaya(reading: LayaReading, keywordSignals: readonly st
   return { tier: 'ordinary', why }
 }
 
-export type Classifier = 'laya' | 'model'
+/** auto: Laya when it answers, else a Claude model; laya or model: that one only. */
+export type Classifier = 'auto' | 'laya' | 'model'
 
 export type Config = {
   routeEffort: boolean
@@ -259,7 +260,7 @@ export const DEFAULTS: Config = {
   cheapModel: 'claude-haiku-5-5',
   ordinaryModel: 'claude-sonnet-5-5',
   strongModel: 'claude-opus-5-5',
-  classifier: 'laya',
+  classifier: 'auto',
   layaUrl: 'http://127.0.0.1:8765',
   classifierModel: 'haiku',
   mechanicalEffort: 'low',
@@ -281,7 +282,7 @@ export function readConfig(options: Readonly<Record<string, unknown>>): Config {
     cheapModel: asString(options.cheapModel, DEFAULTS.cheapModel),
     ordinaryModel: asString(options.ordinaryModel, DEFAULTS.ordinaryModel),
     strongModel: asString(options.strongModel, DEFAULTS.strongModel),
-    classifier: options.classifier === 'model' ? 'model' : options.classifier === 'laya' ? 'laya' : DEFAULTS.classifier,
+    classifier: options.classifier === 'model' || options.classifier === 'laya' || options.classifier === 'auto' ? options.classifier : DEFAULTS.classifier,
     layaUrl: asString(options.layaUrl, DEFAULTS.layaUrl).replace(/\/+$/, ''),
     classifierModel: asString(options.classifierModel, DEFAULTS.classifierModel),
     mechanicalEffort: asEffort(options.mechanicalEffort, DEFAULTS.mechanicalEffort),
