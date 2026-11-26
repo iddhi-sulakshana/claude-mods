@@ -470,3 +470,92 @@ export function spawnArgv(options: SpawnOptions & { isWindows: boolean; shell?: 
     `$env:${ENV_NAME}='${options.name}'; $env:${ENV_ROLE}='${options.role}'; ${command}${flags}`,
   ]
 }
+
+// ---- a plain terminal -------------------------------------------------------
+//
+// Outside cmux and Zendr, bridge_spawn opens a new window of the system's own terminal:
+// Terminal on macOS, Windows Terminal (else a PowerShell window) on Windows, and the first
+// terminal emulator found on Linux ($TERMINAL first). There is no workspace to switch to,
+// so bridge_focus stays a cmux and Zendr feature.
+
+export type Os = 'macos' | 'windows' | 'linux'
+
+/** The operating system from `uname -s` (what `$.session.machine()` answers). */
+export function osFromSysname(sysname: string | undefined): Os {
+  const s = (sysname ?? '').toLowerCase()
+  if (s.startsWith('darwin')) return 'macos'
+  if (s.startsWith('windows') || s.includes('mingw') || s.includes('msys') || s.includes('cygwin')) return 'windows'
+  return 'linux'
+}
+
+/** A POSIX shell word: `it's` becomes `'it'\''s'`. */
+export const shQuote = (text: string): string => `'${text.replace(/'/g, `'\\''`)}'`
+
+/** An AppleScript string literal. */
+const appleString = (text: string): string => `"${text.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+
+/** A PowerShell single-quoted string. */
+const psQuote = (text: string): string => `'${text.replace(/'/g, "''")}'`
+
+const BASE64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+
+/** UTF-16LE in base64: what `powershell -EncodedCommand` takes, so no quoting can break. */
+export function encodePowerShell(script: string): string {
+  const bytes: number[] = []
+  for (let i = 0; i < script.length; i += 1) {
+    const unit = script.charCodeAt(i)
+    bytes.push(unit & 0xff, unit >> 8)
+  }
+  let out = ''
+  for (let i = 0; i < bytes.length; i += 3) {
+    const [a = 0, b = 0, c = 0] = [bytes[i], bytes[i + 1], bytes[i + 2]]
+    const n = (a << 16) | (b << 8) | c
+    out += BASE64[(n >> 18) & 63]! + BASE64[(n >> 12) & 63]!
+    out += i + 1 < bytes.length ? BASE64[(n >> 6) & 63]! : '='
+    out += i + 2 < bytes.length ? BASE64[n & 63]! : '='
+  }
+  return out
+}
+
+/** Linux terminal emulators, in the order they are tried, each with how it takes a command. */
+const LINUX_TERMINALS: [string, ...string[]][] = [
+  ['x-terminal-emulator', '-e'],
+  ['gnome-terminal', '--'],
+  ['konsole', '-e'],
+  ['xfce4-terminal', '-x'],
+  ['kitty'],
+  ['alacritty', '-e'],
+  ['wezterm', 'start', '--'],
+  ['foot'],
+  ['xterm', '-e'],
+]
+
+/**
+ * The ways to open a new terminal window in `cwd` running the spawned session, best first.
+ * Each is tried until one starts. On Linux each is wrapped so it is skipped (exit 127) when
+ * that terminal is not installed, and left running on its own when it is.
+ */
+export function terminalLaunches(
+  os: Os,
+  options: SpawnOptions & { cwd: string; terminal?: string },
+): string[][] {
+  if (os === 'macos') {
+    const line = `cd ${shQuote(options.cwd)} && ${spawnCommand(options)}`
+    return [['osascript', '-e', `tell application "Terminal" to do script ${appleString(line)}`, '-e', 'tell application "Terminal" to activate']]
+  }
+  if (os === 'windows') {
+    const run = spawnArgv({ ...options, isWindows: true })
+    const script = `Set-Location -LiteralPath ${psQuote(options.cwd)}; ${run[run.length - 1]}`
+    const encoded = encodePowerShell(script)
+    return [
+      ['wt.exe', '-w', 'new', '-d', options.cwd, 'powershell', '-NoLogo', '-NoExit', '-EncodedCommand', encoded],
+      ['powershell', '-NoProfile', '-Command',
+        `Start-Process powershell -WorkingDirectory ${psQuote(options.cwd)} -ArgumentList '-NoLogo','-NoExit','-EncodedCommand','${encoded}'`],
+    ]
+  }
+  const inner = ['sh', '-lc', `${spawnCommand(options)}; exec "\${SHELL:-/bin/sh}"`]
+  const chosen = options.terminal?.trim()
+  const terminals: string[][] = [...(chosen ? [[chosen, '-e']] : []), ...LINUX_TERMINALS]
+  const detach = 'command -v "$2" >/dev/null 2>&1 || exit 127; cd "$1" || exit 1; shift; nohup "$@" >/dev/null 2>&1 &'
+  return terminals.map(t => ['sh', '-c', detach, 'sh', options.cwd, ...t, ...inner])
+}

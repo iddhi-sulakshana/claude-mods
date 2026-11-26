@@ -64,12 +64,18 @@ describe('helpers', () => {
 })
 
 /** An in-memory file system, process table and session channel beneath the plugin. */
-function world(on: On, extraEnv: Record<string, string> = {}) {
+/** The machine a test runs on: its `uname -s`, which Linux terminals are installed, and whether Windows Terminal is. */
+type Machine = { sysname?: string; installed?: string[]; hasWt?: boolean }
+
+function world(on: On, extraEnv: Record<string, string> = {}, machine: Machine = {}) {
   const files = new Map<string, string>()
   const cmuxCalls: string[][] = []
   const hcCalls: string[][] = []
   /** Every other command run: the file operations. */
   const commands: string[][] = []
+  /** Terminal windows asked for: osascript, wt.exe, powershell and the Linux sh wrappers. */
+  const launches: string[][] = []
+  const installed = new Set(machine.installed ?? ['xterm'])
   const submitted: string[] = []
   const sent: { to: string; text: string }[] = []
   let refusal: string | undefined
@@ -103,6 +109,7 @@ function world(on: On, extraEnv: Record<string, string> = {}) {
     return { value: { isSet: true as const, version: held.version + 1 } }
   })
   on('session.cwd', () => ({ value: '/work/app' }))
+  on('session.machine', () => ({ value: { sysname: machine.sysname ?? 'Linux', release: '', machine: 'x86_64', packageManagers: [], runtimes: [] } }))
   on('tool.register', ($, e) => ({ value: { tool: `mcp__session-bridge__${e.name}` } }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('ui.status', () => ({ value: undefined }))
@@ -146,6 +153,13 @@ function world(on: On, extraEnv: Record<string, string> = {}) {
       hcCalls.push([...argv])
       return done(0)
     }
+    if (command === 'osascript' || command === 'wt.exe' || command === 'powershell' || command === 'sh') {
+      launches.push([...argv])
+      if (command === 'wt.exe') return done(machine.hasWt === false ? 1 : 0)
+      // sh -c <detach> sh <cwd> <terminal> ...: skipped (127) when that terminal is missing.
+      if (command === 'sh') return done(installed.has(argv[5] ?? '') ? 0 : 127)
+      return done(0)
+    }
     commands.push([...argv])
     // cmd's own, as the bridge runs them on Windows: cmd /d /c move|del|mkdir ...
     if (command === 'cmd') {
@@ -173,6 +187,7 @@ function world(on: On, extraEnv: Record<string, string> = {}) {
     files,
     cmuxCalls,
     hcCalls,
+    launches,
     commands,
     submitted,
     sent,
@@ -186,6 +201,21 @@ function world(on: On, extraEnv: Record<string, string> = {}) {
       fresh = new Map()
     },
   }
+}
+
+/** Reads back what `powershell -EncodedCommand` would run (UTF-16LE in base64). */
+function decodePowerShell(encoded: string): string {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+  const bytes: number[] = []
+  const clean = encoded.replace(/=+$/, '')
+  for (let i = 0; i < clean.length; i += 4) {
+    const n = [0, 1, 2, 3].reduce((acc, k) => (acc << 6) | Math.max(0, alphabet.indexOf(clean[i + k] ?? 'A')), 0)
+    bytes.push((n >> 16) & 255, (n >> 8) & 255, n & 255)
+  }
+  const used = Math.floor((clean.length * 6) / 8)
+  let text = ''
+  for (let i = 0; i + 1 < used; i += 2) text += String.fromCharCode(bytes[i]! | (bytes[i + 1]! << 8))
+  return text
 }
 
 const inboxFiles = (files: Map<string, string>, name: string) =>
@@ -615,14 +645,71 @@ describe('the bridge in cmux', () => {
     expect(cmuxCalls.some(c => c[1] === 'new-workspace')).toBe(false)
   })
 
-  test('bridge_spawn is not offered outside cmux', async ($, on) => {
+  test('bridge_spawn is not offered outside cmux and Zendr with the terminal option off', { options: { terminal: false } }, async ($, on) => {
     mock.clock(on, { now: NOW })
     mock.store(on)
-    const { cmuxCalls } = world(on)
+    const { cmuxCalls, launches } = world(on)
     await start($)
     const result = await $.tool.call({ tool: 'mcp__session-bridge__bridge_spawn', name: 'builder' } as never)
     expect(result.deny).toBeDefined()
     expect(cmuxCalls).toEqual([])
+    expect(launches).toEqual([])
+  })
+
+  test('in a plain terminal on macOS, bridge_spawn opens a Terminal window in the folder', async ($, on) => {
+    mock.clock(on, { now: NOW })
+    mock.store(on)
+    const { files, launches } = world(on, {}, { sysname: 'Darwin' })
+    await start($)
+    const result = await $.tool.call({ tool: 'mcp__session-bridge__bridge_spawn', name: 'builder', cwd: "/work/it's here", message: 'Go.' } as never)
+    expect(result.deny).toBeUndefined()
+    expect(String(result.result)).toContain('a new terminal window')
+    const [osa] = launches
+    expect(osa?.[0]).toBe('osascript')
+    expect(osa?.[2]).toBe(`tell application "Terminal" to do script "cd '/work/it'\\\\''s here' && CLAUDE_SESSION_BRIDGE_NAME=builder CLAUDE_SESSION_BRIDGE_ROLE=general claude"`)
+    expect(inboxFiles(files, 'builder').length).toBe(1)
+  })
+
+  test('in a plain terminal on Windows, bridge_spawn opens Windows Terminal, else a PowerShell window', async ($, on) => {
+    mock.clock(on, { now: NOW })
+    mock.store(on)
+    const { launches } = world(on, { OS: 'Windows_NT' }, { sysname: 'Windows_NT', hasWt: false })
+    await start($)
+    const result = await $.tool.call({ tool: 'mcp__session-bridge__bridge_spawn', name: 'builder', cwd: 'C:/work/app' } as never)
+    expect(result.deny).toBeUndefined()
+    expect(launches.map(l => l[0])).toEqual(['wt.exe', 'powershell'])
+    const encoded = launches[0]?.at(-1) ?? ''
+    expect(launches[1]?.at(-1)).toContain(`'-EncodedCommand','${encoded}'`)
+    expect(decodePowerShell(encoded)).toBe("Set-Location -LiteralPath 'C:/work/app'; $env:CLAUDE_SESSION_BRIDGE_NAME='builder'; $env:CLAUDE_SESSION_BRIDGE_ROLE='general'; claude")
+  })
+
+  test('in a plain terminal on Linux, bridge_spawn tries $TERMINAL, then the usual terminals, until one is installed', async ($, on) => {
+    mock.clock(on, { now: NOW })
+    mock.store(on)
+    const { launches } = world(on, { TERMINAL: 'myterm' }, { sysname: 'Linux', installed: ['konsole'] })
+    await start($)
+    const result = await $.tool.call({ tool: 'mcp__session-bridge__bridge_spawn', name: 'builder' } as never)
+    expect(result.deny).toBeUndefined()
+    expect(launches.map(l => l[5])).toEqual(['myterm', 'x-terminal-emulator', 'gnome-terminal', 'konsole'])
+    expect(launches.at(-1)?.slice(4)).toEqual(['/work/app', 'konsole', '-e', 'sh', '-lc', 'CLAUDE_SESSION_BRIDGE_NAME=builder CLAUDE_SESSION_BRIDGE_ROLE=general claude; exec "${SHELL:-/bin/sh}"'])
+  })
+
+  test('bridge_spawn says so when no terminal could be opened', async ($, on) => {
+    mock.clock(on, { now: NOW })
+    mock.store(on)
+    world(on, {}, { sysname: 'Linux', installed: [] })
+    await start($)
+    const result = await $.tool.call({ tool: 'mcp__session-bridge__bridge_spawn', name: 'builder' } as never)
+    expect(result.deny).toContain('No terminal emulator')
+  })
+
+  test('outside cmux and Zendr, bridge_focus is not offered', async ($, on) => {
+    mock.clock(on, { now: NOW })
+    mock.store(on)
+    world(on)
+    await start($)
+    const result = await $.tool.call({ tool: 'mcp__session-bridge__bridge_focus', name: 'planner' } as never)
+    expect(result.deny).toBeDefined()
   })
 
   test('bridge_focus switches cmux to a peer that runs in cmux, and refuses one that does not', async ($, on) => {

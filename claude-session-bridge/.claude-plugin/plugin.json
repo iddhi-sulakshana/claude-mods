@@ -1,6 +1,6 @@
 {
   "name": "session-bridge",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Lets running Claude Code sessions message each other and hand off context, so one session can plan or audit while another builds.",
   "author": {
     "name": "iddhi"
@@ -25,10 +25,16 @@
       "description": "Inside Zendr (a terminal with HC_TERMINAL_ID): show the bridge in the sidebar, raise a notification for a held message, name the tab after the session, and allow bridge_spawn and bridge_focus. Off: ignore Zendr.",
       "default": true
     },
+    "terminal": {
+      "type": "boolean",
+      "title": "Open a terminal window outside cmux and Zendr",
+      "description": "Outside cmux and Zendr, bridge_spawn and /bridge-spawn open a new window of the system's terminal: Terminal on macOS, Windows Terminal (else PowerShell) on Windows, $TERMINAL or the first terminal emulator found on Linux. Off: spawning needs cmux or Zendr.",
+      "default": true
+    },
     "spawnCommand": {
       "type": "string",
       "title": "Command for spawned sessions",
-      "description": "What bridge_spawn and /bridge-spawn run in the new cmux workspace or Zendr space. Default: claude. It may start with VAR=value settings; the shell evaluates them when the workspace starts. Do not paste secrets here: read them from a file instead, e.g. ANTHROPIC_API_KEY=\"$(cat ~/.config/some.key)\" claude. On Windows (Zendr) it runs in PowerShell: $env:ANTHROPIC_BASE_URL='https://proxy.example'; claude",
+      "description": "What bridge_spawn and /bridge-spawn run in the new cmux workspace, Zendr space or terminal window. Default: claude. It may start with VAR=value settings; the shell evaluates them when the workspace starts. Do not paste secrets here: read them from a file instead, e.g. ANTHROPIC_API_KEY=\"$(cat ~/.config/some.key)\" claude. On Windows it runs in PowerShell: $env:ANTHROPIC_BASE_URL='https://proxy.example'; claude",
       "default": "claude"
     }
   }

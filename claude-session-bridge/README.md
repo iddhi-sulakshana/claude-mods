@@ -82,7 +82,7 @@ Spawn and focus:
 | `/bridge-spawn <name> [role] [--skip-permissions] [-- first message]` | Opens a new cmux workspace running `claude`, already named and with its role. Anything after ` -- ` is queued as its first message. |
 | `/bridge-focus <name>` | Switches cmux to that session's workspace |
 
-The model can do the same with the `bridge_spawn` and `bridge_focus` tools. Both are only offered inside cmux. `bridge_spawn` takes `name`, and optionally `role`, `cwd`, `message` and `skip_permissions`. It refuses a name a live session already has. Permission prompts stay on unless `--skip-permissions` (or `skip_permissions`) is given, which starts the new session with `--dangerously-skip-permissions`. The model is told to set that only when you ask for it.
+The model can do the same with the `bridge_spawn` and `bridge_focus` tools. Inside cmux they use cmux; in Zendr, Zendr; anywhere else `bridge_spawn` opens a terminal window (see [Any terminal](#any-terminal-macos-windows-linux)) and `bridge_focus` isn't offered. `bridge_spawn` takes `name`, and optionally `role`, `cwd`, `message` and `skip_permissions`. It refuses a name a live session already has. Permission prompts stay on unless `--skip-permissions` (or `skip_permissions`) is given, which starts the new session with `--dangerously-skip-permissions`. The model is told to set that only when you ask for it.
 
 A spawned session picks up its identity from two environment variables, which you can also set yourself when starting `claude` by hand:
 
@@ -127,7 +127,19 @@ In a Claude Code terminal session:
 /plugin install session-bridge --marketplace iddhi-sulakshana/claude-mods
 ```
 
-You can configure it in `/config`: `session-bridge.autoDeliver` (default `true`), `session-bridge.cmux` (default `true`) and `session-bridge.zendr` (default `true`).
+## Any terminal (macOS, Windows, Linux)
+
+Outside cmux and Zendr, the bridge works the same in any terminal: messages, handoffs, the pane and the status line need nothing else. `/bridge-spawn` and `bridge_spawn` open a new window of the system's own terminal, in the folder, running `claude` with the name and role set:
+
+| System | Window |
+| --- | --- |
+| macOS | Terminal (through `osascript`) |
+| Windows | Windows Terminal (`wt.exe`), or a PowerShell window when it isn't installed. The command goes in as `-EncodedCommand`, so no quoting can break it. |
+| Linux | `$TERMINAL` if set, else the first of `x-terminal-emulator`, `gnome-terminal`, `konsole`, `xfce4-terminal`, `kitty`, `alacritty`, `wezterm`, `foot` and `xterm` that is installed. The window keeps a shell open after `claude` exits. |
+
+There's no workspace to switch to, so `/bridge-focus` stays a cmux and Zendr feature. Set the `terminal` option to `false` in `/config` → `session-bridge.terminal` to turn spawning off outside cmux and Zendr.
+
+You can configure it in `/config`: `session-bridge.autoDeliver` (default `true`), `session-bridge.cmux` (default `true`), `session-bridge.zendr` (default `true`) and `session-bridge.terminal` (default `true`).
 
 ## Develop
 

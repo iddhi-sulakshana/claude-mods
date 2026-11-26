@@ -27,6 +27,8 @@ import {
   resolveTarget,
   sanitizeName,
   spawnArgv,
+  terminalLaunches,
+  osFromSysname,
   spawnCommand,
   splitTarget,
   tabTitle,
@@ -34,6 +36,7 @@ import {
   zendrArgv,
   zendrFromEnv,
 } from './bridge'
+import type { Os, SpawnOptions } from './bridge'
 
 type $ = EngineInterface
 
@@ -67,6 +70,12 @@ let zendr: ZendrRef | undefined
 /** What a spawned session runs (the `spawnCommand` option); empty means `claude`. */
 let spawnBin = ''
 let isWindows = false
+/** The operating system, for opening a terminal window outside cmux and Zendr. */
+let os: Os = 'linux'
+/** Outside cmux and Zendr, bridge_spawn opens a new terminal window (the `terminal` option). */
+let plainTerminal = false
+/** $TERMINAL, the Linux terminal a person chose. */
+let preferredTerminal = ''
 /** The login shell a Zendr space runs a spawned session in, off Windows. */
 let loginShell = ''
 /** mkdir, mv and rm, or cmd's own on Windows. */
@@ -113,6 +122,17 @@ async function hostNotify($: $, body: string) {
 
 /** Where a session runs that the bridge can show and start sessions in: cmux, else Zendr. */
 const host = () => (cmux !== undefined ? 'cmux' : zendr !== undefined ? 'Zendr' : undefined)
+/** Where bridge_spawn starts a session, or undefined when it can't. */
+const spawnWhere = () =>
+  cmux !== undefined ? 'a new cmux workspace' : zendr !== undefined ? 'a new Zendr space' : plainTerminal ? 'a new terminal window' : undefined
+
+/** Opens a new terminal window running the session: the first way that starts wins. */
+async function openTerminal($: $, cwd: string, options: SpawnOptions) {
+  for (const argv of terminalLaunches(os, { ...options, cwd, terminal: preferredTerminal })) {
+    if (await sh($, argv)) return true
+  }
+  return false
+}
 const hostRefs = () => ({ ...(cmux ? { cmux } : {}), ...(zendr ? { zendr } : {}) })
 
 /**
@@ -483,9 +503,9 @@ async function spawn(
   $: $,
   input: { name: string; role?: string; cwd?: string; skipPermissions: boolean; message?: string },
 ): Promise<{ ok: true; text: string } | { ok: false; reason: string }> {
-  const where = cmux !== undefined ? 'a new cmux workspace' : 'a new Zendr space'
-  if (host() === undefined) {
-    return { ok: false, reason: 'Spawning needs this session to run inside cmux or Zendr (there is no CMUX_WORKSPACE_ID or HC_TERMINAL_ID here), or their options are off.' }
+  const where = spawnWhere()
+  if (where === undefined) {
+    return { ok: false, reason: 'Spawning is off here: outside cmux and Zendr it opens a terminal window, and the session bridge\'s "terminal" option is off.' }
   }
   const self = await me($)
   const name = sanitizeName(input.name)
@@ -506,6 +526,13 @@ async function spawn(
     const argv = spawnArgv({ ...options, isWindows, shell: loginShell })
     if (!(await zendrRun($, zendrArgv.spawn(zendr, { id: newMessageId(now, Math.random()), name, cwd, argv })))) {
       return { ok: false, reason: 'Zendr could not be asked for a new space (is its core, hc, running?).' }
+    }
+  } else if (!(await openTerminal($, cwd, options))) {
+    return {
+      ok: false,
+      reason: os === 'linux'
+        ? 'No terminal emulator could be opened (set $TERMINAL, or install one such as gnome-terminal, konsole or xterm).'
+        : os === 'macos' ? 'Terminal could not be opened (osascript failed).' : 'Neither Windows Terminal nor PowerShell could be opened.',
     }
   }
   const queued = input.message?.trim()
@@ -560,6 +587,12 @@ export const register: Register = (on, options) => {
     isWindows = (await $.env.get('OS')) === 'Windows_NT'
     files = fileArgv(isWindows)
     loginShell = (await $.env.get('SHELL')) ?? ''
+    try {
+      os = osFromSysname((await $.session.machine()).sysname)
+    } catch {
+      os = isWindows ? 'windows' : 'linux'
+    }
+    preferredTerminal = (await $.env.get('TERMINAL')) ?? ''
     autoDefault = options.autoDeliver !== false
     spawnBin = typeof options.spawnCommand === 'string' ? options.spawnCommand : ''
 
@@ -581,6 +614,7 @@ export const register: Register = (on, options) => {
       // In a Zendr (Herdr) terminal whose core does not answer: leave the Zendr features off.
       if (ref !== undefined && (await sh($, zendrArgv.ping(ref)))) zendr = ref
     }
+    plainTerminal = cmux === undefined && zendr === undefined && options.terminal !== false
 
     // A session started by bridge_spawn carries the name and role it should take.
     const envName = sanitizeName((await $.env.get('CLAUDE_SESSION_BRIDGE_NAME')) ?? '')
@@ -676,13 +710,13 @@ export const register: Register = (on, options) => {
         },
         isDeferred: false,
       }),
-      ...(host() === undefined
+      ...(spawnWhere() === undefined
         ? []
         : [
             $.tool.register({
               name: 'bridge_spawn',
               description:
-                `Session bridge (${host()}): start another Claude Code session in ${cmux !== undefined ? 'a new cmux workspace' : 'a new Zendr space'}, with the given bridge name and role, and optionally queue a first message for it (it reads it as soon as it is up). Use it only when the user asked for a new session. skip_permissions starts it with --dangerously-skip-permissions: set it only when the user explicitly asked for that, never on your own.`,
+                `Session bridge (${host() ?? 'terminal'}): start another Claude Code session in ${spawnWhere()}, with the given bridge name and role, and optionally queue a first message for it (it reads it as soon as it is up). Use it only when the user asked for a new session. skip_permissions starts it with --dangerously-skip-permissions: set it only when the user explicitly asked for that, never on your own.`,
               inputSchema: {
                 type: 'object',
                 properties: {
@@ -696,6 +730,11 @@ export const register: Register = (on, options) => {
               },
               isDeferred: false,
             }),
+            $.command.register({ name: 'bridge-spawn', description: `Session bridge (${host() ?? 'terminal'}): start a named session in ${spawnWhere()}`, argumentHint: '<name> [role] [--skip-permissions] [-- first message]' }),
+          ]),
+      ...(host() === undefined
+        ? []
+        : [
             $.tool.register({
               name: 'bridge_focus',
               description: `Session bridge (${host()}): switch ${host()} to the workspace of another live session that runs in it, so the user can see it.`,
@@ -706,7 +745,6 @@ export const register: Register = (on, options) => {
               },
               isDeferred: false,
             }),
-            $.command.register({ name: 'bridge-spawn', description: `Session bridge (${host()}): start a named session in ${cmux !== undefined ? 'a new cmux workspace' : 'a new Zendr space'}`, argumentHint: '<name> [role] [--skip-permissions] [-- first message]' }),
             $.command.register({ name: 'bridge-focus', description: `Session bridge (${host()}): switch to another session's ${cmux !== undefined ? 'cmux workspace' : 'Zendr terminal'}`, argumentHint: '<name>' }),
           ]),
       $.command.register({ name: 'bridge', description: 'Session bridge: show peers and recent messages in a pane' }),
