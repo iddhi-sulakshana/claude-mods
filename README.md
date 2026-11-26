@@ -8,6 +8,14 @@ Mods for [Claude Code](https://claude.com/claude-code): plugins built on its fun
 | [session-bridge](claude-session-bridge) | Lets running sessions on the same machine message each other and hand off context, so one session can plan or audit while another builds. |
 | [model-router](claude-model-router) | Classifies each turn as mechanical, ordinary or hard, and routes it to a matching model and reasoning effort. |
 
+## Works anywhere
+
+All three run wherever Claude Code runs: macOS, Windows (x64 and ARM) and Linux, in any terminal.
+
+- **next-steps** only uses Claude Code itself.
+- **model-router** asks a local Laya server when there is one, and otherwise a Claude model (the default `auto` classifier).
+- **session-bridge** keeps its messages in `~/.claude/session-bridge` (`%USERPROFILE%` on Windows). Inside [cmux](https://cmux.com) or [Zendr](https://github.com/ruchira-edirisinghe/zendr) it also uses their sidebar, notifications and workspaces. Anywhere else, `/bridge-spawn` opens a new window of the system's own terminal.
+
 ## Install
 
 In a Claude Code terminal session, install any of them by name:
